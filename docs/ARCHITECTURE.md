@@ -218,6 +218,8 @@ checkpoint_interval    = 5 s   # hoặc khi pause/shutdown; phải đảm bảo 
 max_retries            = 3     # cho lỗi tạm thời, có backoff + jitter
 ```
 
+`MaxRetries` là tổng số lần thử (mặc định 3 lần thử = 2 lần retry), không phải số lần retry sau lần thử đầu. Backoff bắt đầu 200 ms, nhân đôi mỗi lần, trần 5 s, jitter đều trong [backoff/2, backoff]; `Retry-After` (giây hoặc HTTP date) là thời gian chờ tối thiểu. Chỉ retry lỗi mạng, 429/503 và 5xx khác; không retry 404, lỗi xác thực, lỗi kích thước, lỗi filesystem, lỗi validation hay cancel.
+
 Các số trên là **giả định khởi đầu** và phải cho phép điều chỉnh. Slot theo host tính trên tổng các request, bao gồm probe; không chỉ dựa vào `http.Transport` để điều phối. Dùng một `http.Client`/`Transport` tái sử dụng, cấu hình giới hạn kết nối, dial/TLS/response-header timeout và idle connection. Không áp `http.Client.Timeout` ngắn cho toàn bộ lượt tải lớn; dùng context và cơ chế phát hiện không có tiến độ phù hợp.
 
 `MaxIdleConnsPerHost` chỉ giới hạn kết nối **nhàn rỗi**; nếu cần giới hạn cả kết nối đang hoạt động, cân nhắc `MaxConnsPerHost` cùng semaphore của scheduler. Xem [Go `net/http` Transport](https://go.dev/src/net/http/transport.go).
