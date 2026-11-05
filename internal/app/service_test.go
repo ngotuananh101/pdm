@@ -294,8 +294,8 @@ func TestMidDownloadContentDispositionConflictResolveConflict(t *testing.T) {
 	// after the transfer (e.g. FinalizeNoClobber race). For the
 	// early Content-Disposition check the engine returns before
 	// creating a .part; the service then stores the conventional
-	// temp path so ResolveConflict can still work (it re-queues
-	// if no .part exists). Either way a TempPath is recorded.
+	// temp path so ResolveConflict can probe it. Either way a
+	// TempPath is recorded.
 	tempPath := snap.TempPath
 	if tempPath == "" {
 		t.Fatal("TempPath empty — .part path not recorded")
@@ -303,18 +303,34 @@ func TestMidDownloadContentDispositionConflictResolveConflict(t *testing.T) {
 	_ = tempPath
 	hitsBefore := cd.hitCount()
 
-	// ResolveConflict(AutoRename) re-queues with FinalizeAutoRename
-	// (the engine's early check returned before writing a .part).
+	// ResolveConflict(AutoRename) cannot finalize: no .part exists
+	// (the engine's early check returned before writing one), so
+	// the job goes finalizing -> failed and waits for Retry; it
+	// must NOT re-queue and must NOT re-download here
+	// (finalizing -> queued is forbidden).
 	if err := svc.ResolveConflict(id, domain.ResolutionAutoRename); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool { return getJob(svc, id).Status == domain.StatusCompleted }, "completed after ResolveConflict")
+	if got := getJob(svc, id).Status; got != domain.StatusFailed {
+		t.Fatalf("status after ResolveConflict = %q, want failed (must not re-queue)", got)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := cd.hitCount(); got != hitsBefore {
+		t.Fatalf("ResolveConflict re-downloaded: hits = %d, want %d", got, hitsBefore)
+	}
+
+	// Retry re-queues with the resolved FinalizeAutoRename mode and
+	// re-downloads to completion.
+	if err := svc.Retry(id); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return getJob(svc, id).Status == domain.StatusCompleted }, "completed after Retry")
 	snap = getJob(svc, id)
 	if snap.Filename != "cdfile (1).bin" {
 		t.Fatalf("Filename = %q, want cdfile (1).bin", snap.Filename)
 	}
 	if cd.hitCount() != hitsBefore+1 {
-		t.Fatalf("ResolveConflict re-download hits = %d, want %d", cd.hitCount(), hitsBefore+1)
+		t.Fatalf("Retry re-download hits = %d, want %d", cd.hitCount(), hitsBefore+1)
 	}
 	// New file has downloaded content; original untouched.
 	got, _ := os.ReadFile(filepath.Join(dir, snap.Filename))
@@ -1160,4 +1176,184 @@ func TestPlatformFinalizeNoClobberConflict(t *testing.T) {
 	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
 		t.Fatal("temp should be moved")
 	}
+}
+
+// failStub always fails the transfer with the given error.
+type failStub struct {
+	err error
+}
+
+func (s *failStub) Download(ctx context.Context, req domain.TransferRequest) (domain.TransferResult, error) {
+	return domain.TransferResult{}, s.err
+}
+
+// TestServiceEnforcesCanTransition (Phase 1, A1) asserts the service
+// itself obeys domain.CanTransition: no operation may jump over a
+// lifecycle stage, and operations attempted in the wrong state are
+// refused with the status left unchanged.
+func TestServiceEnforcesCanTransition(t *testing.T) {
+	t.Run("downloading passes through finalizing", func(t *testing.T) {
+		cfg := testConfig(t)
+		content := []byte("finalizing-observed")
+		cd := &countingDownloader{}
+		srv := httptest.NewServer(cd.handler(content, ""))
+		defer srv.Close()
+
+		svc := newRealService(t, cfg, srv)
+		var mu sync.Mutex
+		var seen []domain.Status
+		svc.SetListener(func() {
+			for _, snap := range svc.List() {
+				mu.Lock()
+				seen = append(seen, snap.Status)
+				mu.Unlock()
+			}
+		})
+		dir := t.TempDir()
+		id, err := svc.AddDownload(AddRequest{
+			URL:            srv.URL + "/file.bin",
+			DestinationDir: dir,
+			Resolution:     domain.ResolutionAutoRename,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, func() bool { return getJob(svc, id).Status == domain.StatusCompleted }, "completed")
+		mu.Lock()
+		defer mu.Unlock()
+		finalIdx, completedIdx := -1, -1
+		for i, s := range seen {
+			if s == domain.StatusFinalizing && finalIdx == -1 {
+				finalIdx = i
+			}
+			if s == domain.StatusCompleted && completedIdx == -1 {
+				completedIdx = i
+			}
+		}
+		if finalIdx == -1 {
+			t.Fatalf("finalizing never observed; statuses seen: %v", seen)
+		}
+		if completedIdx == -1 || finalIdx > completedIdx {
+			t.Fatalf("finalizing (idx %d) not observed before completed (idx %d); seen: %v", finalIdx, completedIdx, seen)
+		}
+		_ = svc.Shutdown(context.Background())
+	})
+
+	t.Run("ResolveConflict rejected outside failed conflict", func(t *testing.T) {
+		cfg := testConfig(t)
+		dir := t.TempDir()
+
+		// Downloading job: ResolveConflict must be refused.
+		release := make(chan struct{})
+		svc := NewService(cfg, &slowStub{release: release})
+		id, err := svc.AddDownload(AddRequest{
+			URL:            "http://example.com/slow.bin",
+			DestinationDir: dir,
+			Resolution:     domain.ResolutionAutoRename,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, func() bool {
+			s := getJob(svc, id).Status
+			return s == domain.StatusDownloading || s == domain.StatusProbing
+		}, "downloading")
+		before := getJob(svc, id).Status
+		if err := svc.ResolveConflict(id, domain.ResolutionAutoRename); !errors.Is(err, domain.ErrInvalidTransition) {
+			t.Fatalf("ResolveConflict on %s job = %v, want ErrInvalidTransition", before, err)
+		}
+		if got := getJob(svc, id).Status; got != before {
+			t.Fatalf("status changed to %q after refused ResolveConflict", got)
+		}
+		close(release)
+		_ = svc.Shutdown(context.Background())
+
+		// Failed job without a file conflict: ResolveConflict refused.
+		svc2 := NewService(cfg, &failStub{err: errors.New("boom")})
+		id2, err := svc2.AddDownload(AddRequest{
+			URL:            "http://example.com/fail.bin",
+			DestinationDir: dir,
+			Resolution:     domain.ResolutionAutoRename,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, func() bool { return getJob(svc2, id2).Status == domain.StatusFailed }, "failed")
+		if err := svc2.ResolveConflict(id2, domain.ResolutionAutoRename); !errors.Is(err, domain.ErrInvalidTransition) {
+			t.Fatalf("ResolveConflict on failed non-conflict job = %v, want ErrInvalidTransition", err)
+		}
+		if got := getJob(svc2, id2).Status; got != domain.StatusFailed {
+			t.Fatalf("status = %q, want failed", got)
+		}
+		_ = svc2.Shutdown(context.Background())
+
+		// Completed job: ResolveConflict refused.
+		content := []byte("done")
+		cd := &countingDownloader{}
+		srv := httptest.NewServer(cd.handler(content, ""))
+		defer srv.Close()
+		svc3 := newRealService(t, cfg, srv)
+		id3, err := svc3.AddDownload(AddRequest{
+			URL:            srv.URL + "/ok.bin",
+			DestinationDir: dir,
+			Resolution:     domain.ResolutionAutoRename,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, func() bool { return getJob(svc3, id3).Status == domain.StatusCompleted }, "completed")
+		if err := svc3.ResolveConflict(id3, domain.ResolutionAutoRename); !errors.Is(err, domain.ErrInvalidTransition) {
+			t.Fatalf("ResolveConflict on completed job = %v, want ErrInvalidTransition", err)
+		}
+		if got := getJob(svc3, id3).Status; got != domain.StatusCompleted {
+			t.Fatalf("status = %q, want completed", got)
+		}
+		_ = svc3.Shutdown(context.Background())
+	})
+
+	t.Run("missing part goes to failed, not queued", func(t *testing.T) {
+		cfg := testConfig(t)
+		content := []byte("mid-download-payload-1234567890")
+		cd := &countingDownloader{}
+		srv := httptest.NewServer(cd.handler(content, `attachment; filename="cdfile.bin"`))
+		defer srv.Close()
+
+		svc := newRealService(t, cfg, srv)
+		dir := t.TempDir()
+		existing := filepath.Join(dir, "cdfile.bin")
+		if err := os.WriteFile(existing, []byte("existing"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		id, err := svc.AddDownload(AddRequest{
+			URL:            srv.URL + "/download",
+			DestinationDir: dir,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, func() bool { return getJob(svc, id).Status == domain.StatusFailed }, "job failed on conflict")
+		if got := getJob(svc, id).ErrorCode; got != domain.ErrorCodeFileConflict {
+			t.Fatalf("ErrorCode = %q, want file_conflict", got)
+		}
+		if cd.hitCount() != 1 {
+			t.Fatalf("hits = %d, want 1 before ResolveConflict", cd.hitCount())
+		}
+		if err := svc.ResolveConflict(id, domain.ResolutionAutoRename); err != nil {
+			t.Fatal(err)
+		}
+		// No .part exists, so the job must go finalizing -> failed and
+		// wait for Retry; it must NOT re-queue (finalizing -> queued
+		// is forbidden) and must NOT re-download.
+		if got := getJob(svc, id).Status; got != domain.StatusFailed {
+			t.Fatalf("status after ResolveConflict = %q, want failed (must not re-queue)", got)
+		}
+		time.Sleep(500 * time.Millisecond)
+		if got := cd.hitCount(); got != 1 {
+			t.Fatalf("server hits = %d, want 1 (ResolveConflict re-downloaded)", got)
+		}
+		if got := getJob(svc, id).Status; got != domain.StatusFailed {
+			t.Fatalf("status = %q, want failed", got)
+		}
+		_ = svc.Shutdown(context.Background())
+	})
 }

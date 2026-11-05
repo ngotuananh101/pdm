@@ -53,6 +53,14 @@ func (s Status) IsTerminal() bool {
 //	finalizing  -> completed, failed
 //	paused      -> queued, cancelled
 //	failed      -> queued          (retry)
+//	failed      -> finalizing      (conflict resolution only: ResolveConflict
+//	                               finalizes the preserved .part file of a
+//	                               failed file_conflict job without
+//	                               re-downloading)
+//	failed      -> cancelled       (conflict resolution only: the user
+//	                               cancels a failed file_conflict job;
+//	                               ResolveConflict(ResolutionCancel)
+//	                               removes the .part file)
 //	cancelled   -> queued          (retry)
 //	completed   -> (terminal, no outgoing transitions)
 func CanTransition(from, to Status) bool {
@@ -83,7 +91,18 @@ func CanTransition(from, to Status) bool {
 			return true
 		}
 	case StatusFailed:
-		if to == StatusQueued {
+		switch to {
+		case StatusQueued:
+			return true
+		case StatusFinalizing:
+			// Only for conflict resolution: ResolveConflict finalizes
+			// the preserved .part file of a failed file_conflict job
+			// without re-downloading.
+			return true
+		case StatusCancelled:
+			// Only for conflict resolution: ResolveConflict with
+			// ResolutionCancel moves a failed file_conflict job to
+			// cancelled and removes its .part file.
 			return true
 		}
 	case StatusCancelled:

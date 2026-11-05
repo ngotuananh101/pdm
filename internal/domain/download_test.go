@@ -74,6 +74,8 @@ func TestCanTransitionAllowed(t *testing.T) {
 		{StatusPaused, StatusQueued},
 		{StatusPaused, StatusCancelled},
 		{StatusFailed, StatusQueued},
+		{StatusFailed, StatusCancelled},
+		{StatusFailed, StatusFinalizing},
 		{StatusCancelled, StatusQueued},
 	}
 	for _, p := range allowed {
@@ -113,7 +115,6 @@ func TestCanTransitionForbidden(t *testing.T) {
 		{StatusFinalizing, StatusCancelled},
 		{StatusFinalizing, StatusQueued},
 		{StatusFailed, StatusPaused},
-		{StatusFailed, StatusCancelled},
 		{StatusCancelled, StatusPaused},
 		{StatusCancelled, StatusFailed},
 		{StatusPaused, StatusFailed},

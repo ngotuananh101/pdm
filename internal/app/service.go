@@ -114,6 +114,21 @@ func (s *Service) SetListener(f func()) {
 	s.mu.Unlock()
 }
 
+// setStatusLocked is the single gate for every status change: it moves
+// j to the given status only when domain.CanTransition allows it, and
+// returns an error wrapping domain.ErrInvalidTransition otherwise,
+// leaving the status unchanged. Caller must hold s.mu. Direct
+// assignments to download.Status outside this helper are forbidden.
+func (s *Service) setStatusLocked(j *job, to domain.Status) error {
+	from := j.download.Status
+	if !domain.CanTransition(from, to) {
+		return fmt.Errorf("%w: cannot move job %q from %q to %q", domain.ErrInvalidTransition, j.download.ID, from, to)
+	}
+	j.download.Status = to
+	j.download.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
 // GetConfig returns the current config.
 func (s *Service) GetConfig() config.Config {
 	s.mu.RLock()
@@ -298,7 +313,10 @@ func (s *Service) Cancel(id string, deleteTemp bool) error {
 	if !j.running {
 		// Queued but not yet dispatched: no worker goroutine exists,
 		// so there is nothing to wait for.
-		j.download.Status = domain.StatusCancelled
+		if err := s.setStatusLocked(j, domain.StatusCancelled); err != nil {
+			s.mu.Unlock()
+			return err
+		}
 		j.download.SpeedBytesPerSec = 0
 		j.download.ETASeconds = -1
 		j.download.UpdatedAt = time.Now().UTC()
@@ -368,7 +386,17 @@ func (s *Service) Cancel(id string, deleteTemp bool) error {
 	if deleteTemp && tempPath != "" && j.download.TempPath == tempPath {
 		j.download.TempPath = ""
 	}
-	j.download.Status = domain.StatusCancelled
+	if j.download.Status != domain.StatusCancelled {
+		// The worker may already have reached a terminal state while
+		// Cancel waited for it (e.g. failed on its own): a forbidden
+		// transition out of a terminal state is refused and the
+		// terminal state stands.
+		if err := s.setStatusLocked(j, domain.StatusCancelled); err != nil {
+			s.mu.Unlock()
+			s.notify()
+			return nil
+		}
+	}
 	j.download.SpeedBytesPerSec = 0
 	j.download.ETASeconds = -1
 	j.download.UpdatedAt = time.Now().UTC()
@@ -399,8 +427,10 @@ func (s *Service) Retry(id string) error {
 	j.download.DownloadedBytes = 0
 	j.download.SpeedBytesPerSec = 0
 	j.download.ETASeconds = -1
-	j.download.Status = domain.StatusQueued
-	j.download.UpdatedAt = time.Now().UTC()
+	if err := s.setStatusLocked(j, domain.StatusQueued); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	j.cancelling = false
 	j.cancel = nil
 	j.done = nil
@@ -423,8 +453,12 @@ func (s *Service) Remove(id string) error {
 		return domain.ErrDownloadNotFound
 	}
 	if j.download.Status.IsActive() || j.download.Status == domain.StatusPaused {
+		// Capture the status while holding mu: the error below is
+		// formatted after Unlock, and run() may change the status
+		// concurrently.
+		st := j.download.Status
 		s.mu.Unlock()
-		return fmt.Errorf("%w: cannot remove active job in status %q", domain.ErrInvalidTransition, j.download.Status)
+		return fmt.Errorf("%w: cannot remove active job in status %q", domain.ErrInvalidTransition, st)
 	}
 	idCopy := id
 	_ = idCopy
@@ -459,7 +493,14 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 	switch res {
 	case domain.ResolutionCancel:
 		tempPath := j.download.TempPath
-		j.download.Status = domain.StatusCancelled
+		// failed -> cancelled is allowed (ARCH §5) only for
+		// conflict resolution: the user cancels a failed
+		// file_conflict job. From any other state setStatusLocked
+		// refuses the transition and the job is left untouched.
+		if err := s.setStatusLocked(j, domain.StatusCancelled); err != nil {
+			s.mu.Unlock()
+			return err
+		}
 		j.download.ErrorCode = ""
 		j.download.ErrorMessage = ""
 		j.download.SuggestedFilename = ""
@@ -491,7 +532,10 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 		destDir := j.download.DestinationDir
 		filename := j.download.Filename
 		j.finalizeMode = mode
-		j.download.Status = domain.StatusFinalizing
+		if err := s.setStatusLocked(j, domain.StatusFinalizing); err != nil {
+			s.mu.Unlock()
+			return err
+		}
 		j.download.ErrorCode = ""
 		_ = prevSuggested
 		s.mu.Unlock()
@@ -513,7 +557,8 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 						} else {
 							jj.download.ErrorCode = domain.ErrorCodeFilesystem
 						}
-						jj.download.Status = domain.StatusFailed
+						// finalizing -> failed is always allowed here.
+						_ = s.setStatusLocked(jj, domain.StatusFailed)
 						jj.download.SpeedBytesPerSec = 0
 						jj.download.ETASeconds = -1
 						jj.download.UpdatedAt = time.Now().UTC()
@@ -524,7 +569,9 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 				}
 				s.mu.Lock()
 				if jj, ok := s.jobs[id]; ok {
-					jj.download.Status = domain.StatusCompleted
+					// The file is already renamed; finalizing ->
+					// completed is always allowed here.
+					_ = s.setStatusLocked(jj, domain.StatusCompleted)
 					jj.download.FinalPath = finalPath
 					jj.download.Filename = finalName
 					jj.download.TempPath = ""
@@ -543,27 +590,30 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 				return nil
 			}
 		}
-		// Temp file missing: re-queue the download with the new mode.
+		// Temp file missing: the download cannot be finalized.
+		// finalizing -> failed is allowed; the job waits for Retry,
+		// which re-queues it with the resolved finalize mode.
+		// finalizing -> queued is forbidden, so there is no dispatch
+		// here.
 		s.mu.Lock()
 		jj, ok := s.jobs[id]
 		if !ok {
 			s.mu.Unlock()
 			return domain.ErrDownloadNotFound
 		}
-		jj.download.Status = domain.StatusQueued
 		jj.download.ErrorCode = ""
-		jj.download.ErrorMessage = ""
+		jj.download.ErrorMessage = "temporary file is missing; retry to download again"
 		jj.download.SuggestedFilename = ""
 		jj.download.DownloadedBytes = 0
 		jj.download.SpeedBytesPerSec = 0
 		jj.download.ETASeconds = -1
 		jj.download.TempPath = ""
-		jj.download.UpdatedAt = time.Now().UTC()
 		jj.cancelling = false
 		jj.cancel = nil
 		jj.done = nil
 		jj.running = false
-		s.tryDispatchLocked()
+		// finalizing -> failed is always allowed here.
+		_ = s.setStatusLocked(jj, domain.StatusFailed)
 		s.mu.Unlock()
 		s.notify()
 		return nil
@@ -591,14 +641,18 @@ func (s *Service) tryDispatchLocked() {
 		if next == nil {
 			return
 		}
+		// queued -> probing is always allowed for the job selected
+		// above; if it ever fails, stop dispatching and leave the
+		// job queued for the next dispatch attempt.
+		if err := s.setStatusLocked(next, domain.StatusProbing); err != nil {
+			return
+		}
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
 		next.cancel = cancel
 		next.done = done
 		next.cancelling = false
 		next.running = true
-		next.download.Status = domain.StatusProbing
-		next.download.UpdatedAt = time.Now().UTC()
 		s.running++
 		id := next.download.ID
 		go s.run(id, ctx, done)
@@ -671,14 +725,24 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 		return
 	}
 	if j.cancelling {
-		j.download.Status = domain.StatusCancelled
+		if err := s.setStatusLocked(j, domain.StatusCancelled); err != nil {
+			// Unreachable: probing -> cancelled is always allowed
+			// for a dispatched job.
+			s.mu.Unlock()
+			return
+		}
 		j.download.SpeedBytesPerSec = 0
 		j.download.ETASeconds = -1
 		j.download.UpdatedAt = time.Now().UTC()
 		s.mu.Unlock()
 		return
 	}
-	j.download.Status = domain.StatusDownloading
+	if err := s.setStatusLocked(j, domain.StatusDownloading); err != nil {
+		// Unreachable: probing -> downloading is always allowed for
+		// a dispatched job.
+		s.mu.Unlock()
+		return
+	}
 	j.download.DownloadedBytes = 0
 	j.download.SpeedBytesPerSec = 0
 	j.download.ETASeconds = -1
@@ -713,7 +777,21 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 	j.download.UpdatedAt = now
 
 	if err == nil {
-		j.download.Status = domain.StatusCompleted
+		// downloading -> finalizing -> completed (ARCH §5). The
+		// engine already finalized the file; record the intermediate
+		// state (and notify while in it) so observers never see
+		// downloading jump straight to completed.
+		if serr := s.setStatusLocked(j, domain.StatusFinalizing); serr != nil {
+			// Unreachable: no other goroutine may move a running
+			// job out of downloading. Report failure rather than
+			// a completion that was never recorded.
+			j.download.ErrorMessage = domain.SanitizeErrorText(serr.Error())
+			// downloading -> failed is always allowed here.
+			_ = s.setStatusLocked(j, domain.StatusFailed)
+			s.mu.Unlock()
+			s.notify()
+			return
+		}
 		j.download.FinalPath = res.FinalPath
 		if res.Filename != "" {
 			j.download.Filename = res.Filename
@@ -726,6 +804,17 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 		j.download.SuggestedFilename = ""
 		j.download.SpeedBytesPerSec = 0
 		j.download.ETASeconds = -1
+		s.mu.Unlock()
+		s.notify()
+		s.mu.Lock()
+		j, ok = s.jobs[id]
+		if !ok {
+			s.mu.Unlock()
+			return
+		}
+		// finalizing -> completed is always allowed here: no other
+		// goroutine may transition a running job out of finalizing.
+		_ = s.setStatusLocked(j, domain.StatusCompleted)
 		s.mu.Unlock()
 		s.notify()
 		return
@@ -745,7 +834,8 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 
 	// Cancellation (via Cancel or Shutdown) takes precedence.
 	if j.cancelling || ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		j.download.Status = domain.StatusCancelled
+		// downloading -> cancelled is always allowed here.
+		_ = s.setStatusLocked(j, domain.StatusCancelled)
 		j.download.SpeedBytesPerSec = 0
 		j.download.ETASeconds = -1
 		s.mu.Unlock()
@@ -755,7 +845,8 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 
 	var fce *domain.FileConflictError
 	if errors.As(err, &fce) {
-		j.download.Status = domain.StatusFailed
+		// downloading -> failed is always allowed here.
+		_ = s.setStatusLocked(j, domain.StatusFailed)
 		j.download.ErrorCode = domain.ErrorCodeFileConflict
 		j.download.ErrorMessage = domain.SanitizeErrorText(err.Error())
 		if fce.Filename != "" {
@@ -780,7 +871,8 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 		return
 	}
 
-	j.download.Status = domain.StatusFailed
+	// downloading -> failed is always allowed here.
+	_ = s.setStatusLocked(j, domain.StatusFailed)
 	j.download.ErrorCode = errorCodeFor(err)
 	j.download.ErrorMessage = domain.SanitizeErrorText(err.Error())
 	j.download.SpeedBytesPerSec = 0

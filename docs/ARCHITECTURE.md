@@ -168,7 +168,12 @@ queued ──start──► probing ──► downloading ──► finalizing �
   │                  └──── error ──┴────────────────┴──► failed
   └────────────── pause ──────────► paused
 paused ──resume──► queued       failed ──retry──► queued
+                                  failed ──cancel conflict──► cancelled
+                                  failed ──resolve conflict──► finalizing
 ```
+
+- `failed ──► finalizing` chỉ dùng cho conflict resolution: `ResolveConflict` finalize file `.part` có sẵn của job `file_conflict` mà không tải lại. Nếu thiếu `.part` thì đi `finalizing ──► failed`, rồi `Retry` mới xếp hàng lại (`failed ──► queued`); không có đường `finalizing ──► queued`. Mọi chuyển trạng thái trong service đều qua một hàm duy nhất kiểm tra `domain.CanTransition`; thao tác ở trạng thái không hợp lệ bị từ chối và trạng thái không đổi.
+- `failed ──► cancelled` chỉ dùng cho conflict resolution: người dùng chọn Cancel khi job `file_conflict` đang ở `failed`; `ResolveConflict(ResolutionCancel)` xóa file `.part` và chuyển job sang `cancelled`, vẫn có thể `Retry` lại (`cancelled ──► queued`).
 
 - Các transition ghi DB nhất quán; service từ chối thao tác không hợp lệ. `completed` là terminal, trừ khi người dùng chủ động xóa bản ghi.
 - `Pause` khi đang tải: phát cancel → chờ worker kết thúc → flush/checkpoint → ghi `paused`. UI có thể biểu diễn `pausing` tạm thời nhưng không được báo paused khi worker vẫn ghi.
@@ -415,3 +420,4 @@ Trạng thái đã xác nhận (2026-11-05). Chi tiết đầy đủ trong ADR: 
 3. **URL có đăng nhập/cookie trong MVP:** Không. Credential storage và browser integration đưa sang giai đoạn sau MVP. (Đã xác nhận)
 4. **Tên file trùng:** Chính sách cấu hình trong Cài đặt, mặc định = hỏi người dùng (ask — chọn Tự đổi tên, Ghi đè, hoặc Hủy). Các chính sách: `ask`, `auto_rename`, `overwrite`. Dùng primitive OS atomic no-clobber (RENAME_NOREPLACE/renameat2 trên Linux, MoveFileExW không MOVEFILE_REPLACE_EXISTING trên Windows), không dựa vào Stat+Rename. (Đã xác nhận)
 5. **Browser integration:** Không bắt buộc ở bản đầu; đưa sang Giai đoạn 5. (Đã xác nhận)
+
