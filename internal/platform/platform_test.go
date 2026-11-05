@@ -734,3 +734,63 @@ func TestSanitizeFilename_GuaranteeFuzz(t *testing.T) {
 		}
 	}
 }
+
+func TestEnsureDestinationDir_RefusesParentSymlink(t *testing.T) {
+	base := t.TempDir()
+	real := t.TempDir()
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	// Destination below a symlinked parent must be refused, even
+	// though the final component itself is a real directory.
+	dest := filepath.Join(link, "sub")
+	if _, err := EnsureDestinationDir(dest); !errors.Is(err, domain.ErrSymlinkTarget) {
+		t.Errorf("parent symlink: err = %v, want ErrSymlinkTarget", err)
+	}
+	if _, err := os.Stat(filepath.Join(real, "sub")); err == nil {
+		t.Errorf("created directory through symlinked parent")
+	}
+}
+
+// Merged from zz_symlink_test.go (deleted after the merge): the old
+// test only failed if a write went through the symlink, without ever
+// asserting the error. It now asserts ErrSymlinkTarget directly.
+func TestSymlinkDestDir(t *testing.T) {
+	base := t.TempDir()
+	real := t.TempDir()
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if _, err := EnsureDestinationDir(link); !errors.Is(err, domain.ErrSymlinkTarget) {
+		t.Errorf("symlink dest dir: err = %v, want ErrSymlinkTarget", err)
+	}
+}
+
+func TestFinalizeTempFile_RefusesSymlinkParentDir(t *testing.T) {
+	outside := t.TempDir()
+	base := t.TempDir()
+	dir := filepath.Join(base, "dest")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "dl.part")
+	if err := os.WriteFile(src, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Swap the checked directory for a symlink to outside, as if it
+	// were replaced between an earlier destination check and finalize.
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, dir); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if _, _, err := FinalizeTempFile(src, dir, "file.txt", domain.FinalizeNoClobber); !errors.Is(err, domain.ErrSymlinkTarget) {
+		t.Errorf("err = %v, want ErrSymlinkTarget", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "file.txt")); err == nil {
+		t.Errorf("file was written through symlinked parent dir")
+	}
+}

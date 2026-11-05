@@ -9,22 +9,47 @@ import (
 	"github.com/ngotuananh101/pdm/internal/domain"
 )
 
+// checkPathNoSymlinks walks every component of path with Lstat and
+// refuses the path if any existing component is a symlink. Components
+// that do not exist yet cannot be symlinks and are skipped, so the
+// check also works for paths about to be created. Only the final
+// component used to be checked, which let a destination below a
+// symlinked parent (e.g. <symlink-to-outside>/sub) write outside the
+// intended tree.
+func checkPathNoSymlinks(path string) error {
+	clean := filepath.Clean(path)
+	for p := clean; ; p = filepath.Dir(p) {
+		if fi, err := os.Lstat(p); err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("%w: path component is a symlink: %s", domain.ErrSymlinkTarget, p)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("platform: lstat path component: %w", err)
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			break
+		}
+	}
+	return nil
+}
+
 // EnsureDestinationDir cleans dir, creates it if needed, and verifies
-// that it is a directory. It returns the cleaned path.
+// that it is a directory. It returns the cleaned path. It refuses the
+// directory if any component of the path is a symlink.
 func EnsureDestinationDir(dir string) (string, error) {
 	if dir == "" {
 		return "", fmt.Errorf("%w: empty destination directory", domain.ErrInvalidDestination)
 	}
 	cleanDir := filepath.Clean(dir)
+	if err := checkPathNoSymlinks(cleanDir); err != nil {
+		return "", err
+	}
 	// If cleanDir already exists as a non-directory, report it
 	// directly instead of surfacing a raw MkdirAll error.
 	if fi, err := os.Stat(cleanDir); err == nil {
 		if !fi.IsDir() {
 			return "", fmt.Errorf("%w: destination is not a directory: %s", domain.ErrInvalidDestination, cleanDir)
-		}
-		// Refuse symlinks: os.Stat follows them, so re-check with Lstat.
-		if lfi, lerr := os.Lstat(cleanDir); lerr == nil && lfi.Mode()&os.ModeSymlink != 0 {
-			return "", fmt.Errorf("%w: destination directory is a symlink: %s", domain.ErrSymlinkTarget, cleanDir)
 		}
 		return cleanDir, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -33,15 +58,17 @@ func EnsureDestinationDir(dir string) (string, error) {
 	if err := os.MkdirAll(cleanDir, 0o755); err != nil {
 		return "", fmt.Errorf("platform: create destination dir: %w", err)
 	}
+	// Re-validate after creation: a parent could have been swapped
+	// for a symlink while MkdirAll was following it.
+	if err := checkPathNoSymlinks(cleanDir); err != nil {
+		return "", err
+	}
 	st, err := os.Stat(cleanDir)
 	if err != nil {
 		return "", fmt.Errorf("platform: stat destination dir: %w", err)
 	}
 	if !st.IsDir() {
 		return "", fmt.Errorf("%w: destination is not a directory", domain.ErrInvalidDestination)
-	}
-	if lfi, lerr := os.Lstat(cleanDir); lerr == nil && lfi.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("%w: destination directory is a symlink: %s", domain.ErrSymlinkTarget, cleanDir)
 	}
 	return cleanDir, nil
 }
@@ -91,6 +118,12 @@ func FinalizeTempFile(tempPath, dir, filename string, mode domain.FinalizeMode) 
 	}
 	if dir == "" {
 		return "", "", fmt.Errorf("%w: empty destination directory", domain.ErrInvalidDestination)
+	}
+	// Re-validate the destination directory instead of trusting that
+	// the caller checked it earlier: it may have been swapped for a
+	// symlink (or below a symlinked parent) in the meantime.
+	if err := checkPathNoSymlinks(dir); err != nil {
+		return "", "", err
 	}
 	target := filepath.Join(dir, filename)
 

@@ -119,20 +119,28 @@ func TestValidateBoundaries(t *testing.T) {
 		{"minSeg 64KiB-1", func(c *Config) { c.MinSegmentSize = (64 << 10) - 1 }, true},
 		{"minSeg 64KiB ok", func(c *Config) { c.MinSegmentSize = 64 << 10 }, false},
 		{"minSeg 1MiB ok", func(c *Config) { c.MinSegmentSize = 1 << 20 }, false},
+		{"minSeg 64MiB ok", func(c *Config) { c.MinSegmentSize = 64 << 20 }, false},
+		{"minSeg 64MiB+1", func(c *Config) { c.MinSegmentSize = (64 << 20) + 1 }, true},
 		// BufferSize >= 4<<10
 		{"buffer 0", func(c *Config) { c.BufferSize = 0 }, true},
 		{"buffer 4KiB-1", func(c *Config) { c.BufferSize = (4 << 10) - 1 }, true},
 		{"buffer 4KiB ok", func(c *Config) { c.BufferSize = 4 << 10 }, false},
 		{"buffer 64KiB ok", func(c *Config) { c.BufferSize = 64 << 10 }, false},
+		{"buffer 1MiB ok", func(c *Config) { c.BufferSize = 1 << 20 }, false},
+		{"buffer 1GiB", func(c *Config) { c.BufferSize = 1 << 30 }, true},
 		// ProgressInterval >= 50ms
 		{"progress 0", func(c *Config) { c.ProgressInterval = 0 }, true},
 		{"progress 49ms", func(c *Config) { c.ProgressInterval = 49 * time.Millisecond }, true},
 		{"progress 50ms ok", func(c *Config) { c.ProgressInterval = 50 * time.Millisecond }, false},
 		{"progress negative", func(c *Config) { c.ProgressInterval = -time.Second }, true},
+		{"progress 5s ok", func(c *Config) { c.ProgressInterval = 5 * time.Second }, false},
+		{"progress 1h", func(c *Config) { c.ProgressInterval = time.Hour }, true},
 		// CheckpointInterval >= 250ms
 		{"checkpoint 0", func(c *Config) { c.CheckpointInterval = 0 }, true},
 		{"checkpoint 249ms", func(c *Config) { c.CheckpointInterval = 249 * time.Millisecond }, true},
 		{"checkpoint 250ms ok", func(c *Config) { c.CheckpointInterval = 250 * time.Millisecond }, false},
+		{"checkpoint 60s ok", func(c *Config) { c.CheckpointInterval = 60 * time.Second }, false},
+		{"checkpoint 61s", func(c *Config) { c.CheckpointInterval = 61 * time.Second }, true},
 		// MaxRetries 0..20
 		{"retries -1", func(c *Config) { c.MaxRetries = -1 }, true},
 		{"retries 0 ok", func(c *Config) { c.MaxRetries = 0 }, false},
@@ -142,6 +150,8 @@ func TestValidateBoundaries(t *testing.T) {
 		{"stall 0", func(c *Config) { c.StallTimeout = 0 }, true},
 		{"stall 99ms", func(c *Config) { c.StallTimeout = 99 * time.Millisecond }, true},
 		{"stall 100ms ok", func(c *Config) { c.StallTimeout = 100 * time.Millisecond }, false},
+		{"stall 5m ok", func(c *Config) { c.StallTimeout = 5 * time.Minute }, false},
+		{"stall 1h", func(c *Config) { c.StallTimeout = time.Hour }, true},
 	}
 
 	_ = baseline

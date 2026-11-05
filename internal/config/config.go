@@ -50,6 +50,12 @@ const (
 	maxMaxRetries               = 20
 	minStallTimeout             = 100 * time.Millisecond
 
+	maxMinSegmentSize     int64 = 64 << 20 // 64 MiB
+	maxBufferSize               = 1 << 20  // 1 MiB
+	maxProgressInterval         = 5 * time.Second
+	maxCheckpointInterval       = 60 * time.Second
+	maxStallTimeout             = 5 * time.Minute
+
 	DefaultProgressInterval   = 500 * time.Millisecond
 	DefaultCheckpointInterval = 5 * time.Second
 	DefaultMaxRetries         = 3
@@ -106,23 +112,23 @@ func (c Config) Validate() error {
 	if c.MaxConnectionsPerHost < minMaxConnectionsPerHost || c.MaxConnectionsPerHost > maxMaxConnectionsPerHost {
 		return fmt.Errorf("config: max connections per host must be %d..%d, got %d", minMaxConnectionsPerHost, maxMaxConnectionsPerHost, c.MaxConnectionsPerHost)
 	}
-	if c.MinSegmentSize < minMinSegmentSize {
-		return fmt.Errorf("config: min segment size must be >= %d, got %d", minMinSegmentSize, c.MinSegmentSize)
+	if c.MinSegmentSize < minMinSegmentSize || c.MinSegmentSize > maxMinSegmentSize {
+		return fmt.Errorf("config: min segment size must be %d..%d, got %d", minMinSegmentSize, maxMinSegmentSize, c.MinSegmentSize)
 	}
-	if c.BufferSize < minBufferSize {
-		return fmt.Errorf("config: buffer size must be >= %d, got %d", minBufferSize, c.BufferSize)
+	if c.BufferSize < minBufferSize || c.BufferSize > maxBufferSize {
+		return fmt.Errorf("config: buffer size must be %d..%d, got %d", minBufferSize, maxBufferSize, c.BufferSize)
 	}
-	if c.ProgressInterval < minProgressInterval {
-		return fmt.Errorf("config: progress interval must be >= %s, got %s", minProgressInterval, c.ProgressInterval)
+	if c.ProgressInterval < minProgressInterval || c.ProgressInterval > maxProgressInterval {
+		return fmt.Errorf("config: progress interval must be %s..%s, got %s", minProgressInterval, maxProgressInterval, c.ProgressInterval)
 	}
-	if c.CheckpointInterval < minCheckpointInterval {
-		return fmt.Errorf("config: checkpoint interval must be >= %s, got %s", minCheckpointInterval, c.CheckpointInterval)
+	if c.CheckpointInterval < minCheckpointInterval || c.CheckpointInterval > maxCheckpointInterval {
+		return fmt.Errorf("config: checkpoint interval must be %s..%s, got %s", minCheckpointInterval, maxCheckpointInterval, c.CheckpointInterval)
 	}
 	if c.MaxRetries < minMaxRetries || c.MaxRetries > maxMaxRetries {
 		return fmt.Errorf("config: max retries must be %d..%d, got %d", minMaxRetries, maxMaxRetries, c.MaxRetries)
 	}
-	if c.StallTimeout < minStallTimeout {
-		return fmt.Errorf("config: stall timeout must be >= %s, got %s", minStallTimeout, c.StallTimeout)
+	if c.StallTimeout < minStallTimeout || c.StallTimeout > maxStallTimeout {
+		return fmt.Errorf("config: stall timeout must be %s..%s, got %s", minStallTimeout, maxStallTimeout, c.StallTimeout)
 	}
 	return nil
 }
