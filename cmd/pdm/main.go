@@ -26,6 +26,16 @@ func main() {
 	logger.Info("pdm starting")
 
 	cfg := config.Default(platform.DefaultDownloadDir())
+	// Load persisted settings (Phase 7, U1): a missing, corrupt,
+	// or invalid settings file falls back to defaults (config.Load
+	// never fails hard), so bad settings can never prevent startup.
+	if dir, err := platform.AppDataDir(); err != nil {
+		logger.Warn("pdm: cannot locate app data dir, using default settings", "err", err)
+	} else if loaded, err := config.Load(dir, cfg); err != nil {
+		logger.Warn("pdm: using default settings", "err", err)
+	} else {
+		cfg = loaded
+	}
 	// engine.NewHTTPClient never returns a nil client.
 	httpClient := engine.NewHTTPClient(cfg)
 	downloader := engine.NewSingleDownloader(cfg, httpClient)

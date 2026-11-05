@@ -72,6 +72,14 @@ type DownloadService interface {
 	Cancel(id string, deleteTemp bool) error
 	// Retry re-queues a failed or cancelled download.
 	Retry(id string) error
+	// Pause stops an active download and parks it in paused,
+	// keeping the .part file. A queued download is parked without
+	// starting.
+	Pause(id string) error
+	// Resume re-queues a paused download from the beginning:
+	// Stage 1 has no HTTP Range resume, so the next worker
+	// downloads the file again from byte 0.
+	Resume(id string) error
 	// Remove deletes the record from the list without touching any file.
 	Remove(id string) error
 	// ResolveConflict applies the chosen resolution to a download stuck
@@ -81,7 +89,12 @@ type DownloadService interface {
 	List() []DownloadSnapshot
 	// GetConfig returns the current settings.
 	GetConfig() Config
-	// SaveConfig persists the settings.
+	// SaveConfig validates the settings, stores them in memory, and
+	// persists them to the settings file in the app data directory
+	// (internal/config store, Phase 7 U1), so they survive a
+	// restart. It returns an error when validation or the disk
+	// write fails; in that case the in-memory settings may already
+	// be updated for this session, but they are not persisted.
 	SaveConfig(ScratchConfig) error
 	// SetListener registers f, called after every state change. The
 	// service must not hold locks while calling f; UI handlers must
@@ -144,7 +157,45 @@ func (s *NoopService) AddDownload(req AddRequest) (string, error) {
 
 func (s *NoopService) Cancel(_ string, _ bool) error { s.notify(); return nil }
 func (s *NoopService) Retry(_ string) error          { s.notify(); return nil }
-func (s *NoopService) Remove(_ string) error         { s.notify(); return nil }
+
+// setSnapStatusLocked moves the snapshot with id to to when its
+// current status is in allowed. Caller must hold s.mu.
+func (s *NoopService) setSnapStatusLocked(id string, allowed []Status, to Status, verb string) error {
+	for i := range s.snaps {
+		if s.snaps[i].ID != id {
+			continue
+		}
+		for _, a := range allowed {
+			if s.snaps[i].Status == a {
+				s.snaps[i].Status = to
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: cannot %s download in status %q", domain.ErrInvalidTransition, verb, s.snaps[i].Status)
+	}
+	return domain.ErrDownloadNotFound
+}
+
+func (s *NoopService) Pause(id string) error {
+	s.mu.Lock()
+	err := s.setSnapStatusLocked(id, []Status{StatusQueued, StatusProbing, StatusDownloading, StatusFinalizing}, StatusPaused, "pause")
+	s.mu.Unlock()
+	if err == nil {
+		s.notify()
+	}
+	return err
+}
+
+func (s *NoopService) Resume(id string) error {
+	s.mu.Lock()
+	err := s.setSnapStatusLocked(id, []Status{StatusPaused}, StatusQueued, "resume")
+	s.mu.Unlock()
+	if err == nil {
+		s.notify()
+	}
+	return err
+}
+func (s *NoopService) Remove(_ string) error { s.notify(); return nil }
 func (s *NoopService) ResolveConflict(_ string, _ Resolution) error {
 	s.notify()
 	return nil

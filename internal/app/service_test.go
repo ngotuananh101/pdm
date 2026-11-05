@@ -1369,9 +1369,13 @@ func TestServiceEnforcesCanTransition(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Wait for downloading, not just probing: the worker moves
+		// probing -> downloading on its own, so asserting the status
+		// is unchanged after a refused ResolveConflict is only
+		// meaningful once the job is downloading (slowStub blocks
+		// there until release is closed).
 		waitFor(t, func() bool {
-			s := getJob(svc, id).Status
-			return s == domain.StatusDownloading || s == domain.StatusProbing
+			return getJob(svc, id).Status == domain.StatusDownloading
 		}, "downloading")
 		before := getJob(svc, id).Status
 		if err := svc.ResolveConflict(id, domain.ResolutionAutoRename); !errors.Is(err, domain.ErrInvalidTransition) {

@@ -8,6 +8,7 @@ import (
 	"github.com/ngotuananh101/pdm/internal/app"
 	"github.com/ngotuananh101/pdm/internal/config"
 	"github.com/ngotuananh101/pdm/internal/domain"
+	"github.com/ngotuananh101/pdm/internal/platform"
 )
 
 // AppServiceAdapter adapts the real app.Service (which speaks
@@ -18,6 +19,9 @@ import (
 type AppServiceAdapter struct {
 	svc    *app.Service
 	logger *slog.Logger
+	// settingsDir overrides the directory settings are persisted
+	// to (platform.AppDataDir by default). Tests set it directly.
+	settingsDir string
 }
 
 // NewAppServiceAdapter wraps a real app.Service for the UI.
@@ -157,6 +161,14 @@ func (a *AppServiceAdapter) Retry(id string) error {
 	return a.svc.Retry(id)
 }
 
+func (a *AppServiceAdapter) Pause(id string) error {
+	return a.svc.Pause(id)
+}
+
+func (a *AppServiceAdapter) Resume(id string) error {
+	return a.svc.Resume(id)
+}
+
 func (a *AppServiceAdapter) Remove(id string) error {
 	return a.svc.Remove(id)
 }
@@ -188,7 +200,28 @@ func (a *AppServiceAdapter) SaveConfig(sc ScratchConfig) error {
 	cur.DefaultDownloadDir = sc.DefaultDownloadDir
 	cur.FileConflictPolicy = mapPolicyReverse(sc.ConflictPolicy)
 	cur.MaxActiveDownloads = sc.MaxActiveDownloads
-	return a.svc.UpdateConfig(cur)
+	if err := a.svc.UpdateConfig(cur); err != nil {
+		return err
+	}
+	// Persist the full current config (not just the three edited
+	// fields) so SaveConfig never clobbers settings the UI does
+	// not own. The in-memory config is already updated above; a
+	// disk failure is reported instead of silently pretending the
+	// settings will survive a restart.
+	dir, err := a.settingsDirForSave()
+	if err != nil {
+		return err
+	}
+	return config.Save(dir, cur)
+}
+
+// settingsDirForSave returns the directory settings are persisted
+// to: the test override when set, platform.AppDataDir otherwise.
+func (a *AppServiceAdapter) settingsDirForSave() (string, error) {
+	if a.settingsDir != "" {
+		return a.settingsDir, nil
+	}
+	return platform.AppDataDir()
 }
 
 func (a *AppServiceAdapter) SetListener(f func()) {

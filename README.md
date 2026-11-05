@@ -20,6 +20,15 @@ Implemented today:
 - Cancellation: cancelling an active download cancels its context, waits for
   the worker to exit (file handle released, safe on Windows), and removes
   the `.part` only when the user asked for it.
+- Settings persistence: the Settings dialog saves to
+  `<AppDataDir>/settings.json` and the app loads it at startup; a missing,
+  corrupt, or invalid file falls back to defaults instead of blocking
+  startup. Saving writes the full config, so settings the UI does not own
+  are never clobbered.
+- Pause/Resume: pausing an active download stops its worker, keeps the
+  `.part` file, and parks the job in `paused`; resuming re-queues it and
+  downloads again from the beginning (Stage 1 has no HTTP Range resume —
+  that comes in Stage 3). The Resume button says so on the label.
 - Fyne desktop UI (ARCHITECTURE section 10): downloads list with progress,
   speed, ETA and redacted source; Add URL dialog (URL and filename validated
   with `platform`); Settings dialog (default directory, duplicate-file

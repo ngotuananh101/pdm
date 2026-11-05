@@ -174,6 +174,7 @@ paused ──resume──► queued       failed ──retry──► queued
 
 - `failed ──► finalizing` chỉ dùng cho conflict resolution: `ResolveConflict` finalize file `.part` có sẵn của job `file_conflict` mà không tải lại. Nếu thiếu `.part` thì đi `finalizing ──► failed`, rồi `Retry` mới xếp hàng lại (`failed ──► queued`); không có đường `finalizing ──► queued`. Mọi chuyển trạng thái trong service đều qua một hàm duy nhất kiểm tra `domain.CanTransition`; thao tác ở trạng thái không hợp lệ bị từ chối và trạng thái không đổi.
 - `failed ──► cancelled` chỉ dùng cho conflict resolution: người dùng chọn Cancel khi job `file_conflict` đang ở `failed`; `ResolveConflict(ResolutionCancel)` xóa file `.part` và chuyển job sang `cancelled`, vẫn có thể `Retry` lại (`cancelled ──► queued`).
+- `paused ──► cancelled`: Cancel vẫn dùng được trên job đang `paused` (không có worker đang chạy); nếu chọn xóa file tạm thì file `.part` được giữ lại từ lúc Pause sẽ bị xóa. Job `paused` không Remove trực tiếp được — Cancel trước (job sang `cancelled`), rồi Remove.
 
 - Các transition ghi DB nhất quán; service từ chối thao tác không hợp lệ. `completed` là terminal, trừ khi người dùng chủ động xóa bản ghi.
 - `Pause` khi đang tải: phát cancel → chờ worker kết thúc → flush/checkpoint → ghi `paused`. UI có thể biểu diễn `pausing` tạm thời nhưng không được báo paused khi worker vẫn ghi.
@@ -242,6 +243,7 @@ File thưa/preallocate có thể chứa byte chưa tải, vì vậy **kích thư
 
 ## 9. SQLite và migration
 
+- Stage 1 chưa có SQLite: settings (toàn bộ `config.Config`) được lưu dưới dạng JSON tại `<AppDataDir>/settings.json`, load lúc khởi động và save khi đổi trong dialog Settings. File thiếu, hỏng hoặc không hợp lệ thì dùng mặc định, không chặn khởi động; settings table SQLite ở Stage 2 sẽ thay thế file này.
 - Bắt đầu với `downloads`, `segments`, `schema_migrations`; chỉ thêm settings table khi thực sự cần. `segments.download_id` có foreign key, transaction xóa segment theo policy.
 - Mở DB trong thư mục dữ liệu người dùng, bật `foreign_keys`; cân nhắc WAL và `busy_timeout` theo cách được driver hỗ trợ. Kiểm soát pool/ghi tuần tự để giảm `database is locked`. Các thiết lập theo connection phải được áp dụng nhất quán.
 - Thực hiện migration có version ngay lúc startup, trong transaction khi phù hợp; backup trước migration không tương thích. Không thay đổi schema kiểu ngầm định.
@@ -255,6 +257,8 @@ File thưa/preallocate có thể chứa byte chưa tải, vì vậy **kích thư
 2. **Thêm tải:** URL, thư mục, tên file tùy chọn; báo lỗi hợp lệ trước khi tạo.
 3. **Chi tiết:** kích thước, nguồn đã che, đường dẫn, số đoạn, lỗi và tùy chọn retry.
 4. **Cài đặt:** thư mục mặc định, số tải đồng thời, số kết nối, chính sách khi đóng cửa sổ.
+
+- **Tạm dừng/tiếp tục (Stage 1):** Pause hủy context của worker, chờ worker thoát rồi mới ghi `paused`, giữ nguyên file `.part`; Resume xếp hàng lại và tải lại từ đầu (chưa resume từ điểm dừng — cần HTTP Range, Stage 3). Nút Resume ghi rõ “tải lại từ đầu” để không gây hiểu lầm.
 
 Dùng widget danh sách có tái sử dụng item thay vì tạo hàng nghìn widget; snapshot chỉ chứa dữ liệu cần hiển thị. Đo CPU/render khi nhiều job thay đổi. Snapshot tổng hợp đưa vào `fyne.Do`; không giữ mutex trong lúc chờ UI. Tốc độ dựa trên chênh lệch byte/thời gian, ETA chỉ hiện khi có tổng và tốc độ đáng tin cậy.
 

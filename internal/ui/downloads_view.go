@@ -54,7 +54,7 @@ func newRowTemplate() fyne.CanvasObject {
 
 // updateRowContents refreshes a row's widgets from its view model. It is
 // called on the Fyne main thread (inside fyne.Do).
-func updateRowContents(obj fyne.CanvasObject, r RowViewModel, onCancel, onResolve, onRetry, onRemove func(string)) {
+func updateRowContents(obj fyne.CanvasObject, r RowViewModel, onCancel, onResolve, onRetry, onRemove, onPause, onResume func(string)) {
 	root, ok := obj.(*fyne.Container)
 	if !ok || len(root.Objects) == 0 {
 		return
@@ -102,7 +102,16 @@ func updateRowContents(obj fyne.CanvasObject, r RowViewModel, onCancel, onResolv
 	id := r.ID
 	switch {
 	case isActive(r):
+		pause := widget.NewButton("Pause", func() { onPause(id) })
 		btn := widget.NewButton("Cancel", func() { onCancel(id) })
+		actions.Add(pause)
+		actions.Add(btn)
+	case r.Status == StatusPaused:
+		// The label states the Stage 1 semantics: Resume restarts
+		// the download from the beginning (no Range resume yet).
+		resume := widget.NewButton("Resume (restarts from start)", func() { onResume(id) })
+		btn := widget.NewButton("Cancel", func() { onCancel(id) })
+		actions.Add(resume)
 		actions.Add(btn)
 	case r.ErrorCode == ErrorCodeFileConflict:
 		btn := widget.NewButton("Resolve Conflict", func() { onResolve(id) })
@@ -130,23 +139,27 @@ type downloadsView struct {
 	onResolve func(string)
 	onRetry   func(string)
 	onRemove  func(string)
+	onPause   func(string)
+	onResume  func(string)
 }
 
 // newDownloadsView builds the list and empty state. Button callbacks are
 // stored so updateRowContents can wire them per row.
-func newDownloadsView(svc DownloadService, onCancel, onResolve, onRetry, onRemove func(string)) *downloadsView {
+func newDownloadsView(svc DownloadService, onCancel, onResolve, onRetry, onRemove, onPause, onResume func(string)) *downloadsView {
 	dv := &downloadsView{
 		svc:       svc,
 		onCancel:  onCancel,
 		onResolve: onResolve,
 		onRetry:   onRetry,
 		onRemove:  onRemove,
+		onPause:   onPause,
+		onResume:  onResume,
 	}
 	dv.list = widget.NewList(
 		func() int { return len(dv.rows) },
 		newRowTemplate,
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			updateRowContents(obj, dv.rows[id], dv.onCancel, dv.onResolve, dv.onRetry, dv.onRemove)
+			updateRowContents(obj, dv.rows[id], dv.onCancel, dv.onResolve, dv.onRetry, dv.onRemove, dv.onPause, dv.onResume)
 		},
 	)
 	dv.empty = widget.NewLabelWithStyle(
@@ -193,15 +206,18 @@ func (dv *downloadsView) refreshWithSnapshots(snaps []DownloadSnapshot) {
 	dv.summary.SetText(Summarize(snaps))
 }
 
-// Summarize renders the "active / queued / completed" status bar text.
+// Summarize renders the "active / queued / paused / completed"
+// status bar text.
 func Summarize(snaps []DownloadSnapshot) string {
-	var active, queued, completed, failed int
+	var active, queued, paused, completed, failed int
 	for _, s := range snaps {
 		switch s.Status {
 		case StatusDownloading, StatusProbing, StatusFinalizing:
 			active++
 		case StatusQueued:
 			queued++
+		case StatusPaused:
+			paused++
 		case StatusCompleted:
 			completed++
 		case StatusFailed:
@@ -209,7 +225,7 @@ func Summarize(snaps []DownloadSnapshot) string {
 		}
 	}
 	return "Active: " + itoa(active) + "   Queued: " + itoa(queued) +
-		"   Completed: " + itoa(completed) + "   Failed: " + itoa(failed)
+		"   Paused: " + itoa(paused) + "   Completed: " + itoa(completed) + "   Failed: " + itoa(failed)
 }
 
 func itoa(n int) string {

@@ -121,6 +121,21 @@ func (ad *addDialog) submit() bool {
 	return false
 }
 
+// resolveConflictAdd retries AddDownload with the chosen resolution.
+// It returns true only when the download was created. On failure it
+// shows the error in the add dialog and leaves the add dialog open,
+// so a second failure (e.g. the suggested name was just taken) is
+// never swallowed by closing the dialog as if it had succeeded.
+func (ad *addDialog) resolveConflictAdd(res Resolution, url, dir, name string) bool {
+	_, err := ad.svc.AddDownload(AddRequest{URL: url, DestinationDir: dir, Filename: name, Resolution: &res})
+	if err != nil {
+		ad.showError(err.Error())
+		return false
+	}
+	ad.errLabel.Hide()
+	return true
+}
+
 // showConflictPrompt offers auto-rename / overwrite / cancel. On cancel the
 // add dialog is reopened without touching any file.
 func (ad *addDialog) showConflictPrompt(conflictErr *FileConflictError, url, dir, name string) {
@@ -133,25 +148,29 @@ func (ad *addDialog) showConflictPrompt(conflictErr *FileConflictError, url, dir
 	var d dialog.Dialog
 	buttons := container.NewHBox(
 		widget.NewButton("Auto-rename ("+suggested+")", func() {
-			res := ResolutionAutoRename
-			_, _ = ad.svc.AddDownload(AddRequest{URL: url, DestinationDir: dir, Filename: name, Resolution: &res})
-			ad.errLabel.Hide()
-			if d != nil {
+			if ad.resolveConflictAdd(ResolutionAutoRename, url, dir, name) {
+				if d != nil {
+					d.Hide()
+				}
+				if ad.dlg != nil {
+					ad.dlg.Hide()
+				}
+			} else if d != nil {
+				// Back to the add dialog, which now shows the error.
 				d.Hide()
-			}
-			if ad.dlg != nil {
-				ad.dlg.Hide()
 			}
 		}),
 		widget.NewButton("Overwrite existing file", func() {
-			res := ResolutionOverwrite
-			_, _ = ad.svc.AddDownload(AddRequest{URL: url, DestinationDir: dir, Filename: name, Resolution: &res})
-			ad.errLabel.Hide()
-			if d != nil {
+			if ad.resolveConflictAdd(ResolutionOverwrite, url, dir, name) {
+				if d != nil {
+					d.Hide()
+				}
+				if ad.dlg != nil {
+					ad.dlg.Hide()
+				}
+			} else if d != nil {
+				// Back to the add dialog, which now shows the error.
 				d.Hide()
-			}
-			if ad.dlg != nil {
-				ad.dlg.Hide()
 			}
 		}),
 		widget.NewButton("Cancel", func() {
@@ -178,17 +197,30 @@ func showRuntimeConflictPrompt(parent fyne.Window, svc DownloadService, snap Dow
 	msg := fmt.Sprintf("“%s” already exists in the destination directory.\n\nHow should PDM handle this conflict?", snap.Filename)
 	id := snap.ID
 
+	errLabel := widget.NewLabel("")
+	errLabel.Wrapping = fyne.TextWrapWord
+	errLabel.Hide()
+	// resolve applies one resolution and reports its error so the
+	// prompt can stay open on failure instead of closing as if the
+	// conflict had been resolved.
+	resolve := func(res Resolution) bool {
+		if err := svc.ResolveConflict(id, res); err != nil {
+			errLabel.SetText(domain.SanitizeErrorText(err.Error()))
+			errLabel.Show()
+			return false
+		}
+		return true
+	}
+
 	var d dialog.Dialog
 	buttons := container.NewHBox(
 		widget.NewButton("Auto-rename ("+suggested+")", func() {
-			_ = svc.ResolveConflict(id, ResolutionAutoRename)
-			if d != nil {
+			if resolve(ResolutionAutoRename) && d != nil {
 				d.Hide()
 			}
 		}),
 		widget.NewButton("Overwrite existing file", func() {
-			_ = svc.ResolveConflict(id, ResolutionOverwrite)
-			if d != nil {
+			if resolve(ResolutionOverwrite) && d != nil {
 				d.Hide()
 			}
 		}),
@@ -198,7 +230,7 @@ func showRuntimeConflictPrompt(parent fyne.Window, svc DownloadService, snap Dow
 			}
 		}),
 	)
-	content := container.NewVBox(widget.NewLabel(msg), buttons)
+	content := container.NewVBox(widget.NewLabel(msg), errLabel, buttons)
 	d = dialog.NewCustom("File Exists", "Dismiss", content, parent)
 	d.Show()
 }

@@ -534,12 +534,13 @@ func TestSummarizeCounts(t *testing.T) {
 		{Status: StatusDownloading},
 		{Status: StatusProbing},
 		{Status: StatusQueued},
+		{Status: StatusPaused},
 		{Status: StatusCompleted},
 		{Status: StatusFailed},
 		{Status: StatusCancelled},
 	}
 	got := Summarize(snaps)
-	want := "Active: 2   Queued: 1   Completed: 1   Failed: 1"
+	want := "Active: 2   Queued: 1   Paused: 1   Completed: 1   Failed: 1"
 	if got != want {
 		t.Errorf("Summarize = %q, want %q", got, want)
 	}

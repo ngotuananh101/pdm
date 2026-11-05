@@ -55,7 +55,7 @@ func NewMainWindow(a fyne.App, svc DownloadService, _ ServiceFactory, onClose fu
 		shutdownDone:     make(chan struct{}),
 		logger:           defaultLogger{},
 	}
-	mw.view = newDownloadsView(svc, mw.handleCancel, mw.handleResolve, mw.handleRetry, mw.handleRemove)
+	mw.view = newDownloadsView(svc, mw.handleCancel, mw.handleResolve, mw.handleRetry, mw.handleRemove, mw.handlePause, mw.handleResume)
 	mw.window.Resize(fyne.NewSize(900, 600))
 
 	addBtn := widget.NewButton("Add URL", func() {
@@ -218,6 +218,14 @@ func (mw *MainWindow) handleResolve(id string) {
 
 func (mw *MainWindow) handleRetry(id string) {
 	_ = mw.svc.Retry(id)
+}
+
+func (mw *MainWindow) handlePause(id string) {
+	_ = mw.svc.Pause(id)
+}
+
+func (mw *MainWindow) handleResume(id string) {
+	_ = mw.svc.Resume(id)
 }
 
 func (mw *MainWindow) handleRemove(id string) {

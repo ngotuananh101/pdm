@@ -50,6 +50,14 @@ type job struct {
 	running    bool
 	cancelling bool
 
+	// pausing is true while a Pause is stopping this job's worker
+	// (U3, Phase 7): Pause cancels the worker context exactly like
+	// Cancel, and run() parks the job in paused instead of cancelled
+	// when it sees this flag. It is cleared by run() when the worker
+	// exits, or by Resume/Retry when a new generation starts, so a
+	// stale flag can never park a fresh generation.
+	pausing bool
+
 	// resolving is true while a ResolveConflict finalize is in
 	// flight (status finalizing, rename running outside mu).
 	// resolveDone is closed when that ResolveConflict returns, so
@@ -357,7 +365,12 @@ func (s *Service) Cancel(id string, deleteTemp bool) error {
 		s.mu.Unlock()
 		return nil
 	}
-	if !j.download.Status.IsActive() {
+	// A paused job has no worker, but it can still be cancelled:
+	// paused -> cancelled is allowed (ARCH section 5), so a
+	// paused job is never a trap state — Cancel it (optionally
+	// deleting the preserved .part) instead of having to Resume
+	// it first.
+	if !j.download.Status.IsActive() && j.download.Status != domain.StatusPaused {
 		// Capture the status while holding mu: the error below is
 		// formatted after Unlock, and run() may change the status
 		// concurrently (same post-Unlock read Phase 1 fixed in
@@ -514,6 +527,169 @@ func (s *Service) Retry(id string) error {
 		return err
 	}
 	j.cancelling = false
+	j.pausing = false
+	j.cancel = nil
+	j.done = nil
+	j.running = false
+	j.lastBytes = 0
+	j.lastTime = time.Time{}
+	s.tryDispatchLocked()
+	s.mu.Unlock()
+	s.notify()
+	return nil
+}
+
+// Pause stops an active download and parks it in paused (U3,
+// Phase 7). Like Cancel, it cancels the worker context and waits
+// for the worker goroutine to exit before returning, so no worker
+// is still writing when the job reports paused. Unlike Cancel, it
+// keeps the .part file (TempPath is preserved) and never deletes
+// anything. A queued job that has not started yet is parked
+// without ever starting a worker. Resume re-queues a paused job;
+// Stage 1 has no HTTP Range resume, so the next worker downloads
+// from the beginning.
+func (s *Service) Pause(id string) error {
+	// If a ResolveConflict is finalizing this job, wait for it to
+	// finish before deciding, exactly like Cancel (ARCH section 4):
+	// the resolve owns the rename, and a Pause decided mid-rename
+	// could only lose to it.
+	for {
+		s.mu.Lock()
+		j, ok := s.jobs[id]
+		if !ok {
+			s.mu.Unlock()
+			return domain.ErrDownloadNotFound
+		}
+		if !j.resolving || j.resolveDone == nil {
+			s.mu.Unlock()
+			break
+		}
+		rd := j.resolveDone
+		s.mu.Unlock()
+		<-rd
+	}
+
+	s.mu.Lock()
+	j, ok := s.jobs[id]
+	if !ok {
+		s.mu.Unlock()
+		return domain.ErrDownloadNotFound
+	}
+	if j.download.Status == domain.StatusPaused {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: job %q is already paused", domain.ErrInvalidTransition, id)
+	}
+	if !j.download.Status.IsActive() {
+		st := j.download.Status
+		s.mu.Unlock()
+		return fmt.Errorf("%w: cannot pause job in status %q", domain.ErrInvalidTransition, st)
+	}
+	if !j.running {
+		// Queued but not yet dispatched: no worker goroutine
+		// exists, so there is nothing to wait for.
+		if err := s.setStatusLocked(j, domain.StatusPaused); err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		j.download.SpeedBytesPerSec = 0
+		j.download.ETASeconds = -1
+		j.download.UpdatedAt = time.Now().UTC()
+		s.mu.Unlock()
+		s.notify()
+		return nil
+	}
+	j.pausing = true
+	cancel := j.cancel
+	done := j.done
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+
+	s.mu.Lock()
+	j, ok = s.jobs[id]
+	if !ok {
+		s.mu.Unlock()
+		return domain.ErrDownloadNotFound
+	}
+	// Generation check (A2, same as Cancel): if a Retry has
+	// started a new generation since this Pause began, the old
+	// Pause must not touch the new job's status. The new
+	// generation owns its own lifecycle.
+	if j.done != done {
+		s.mu.Unlock()
+		return nil
+	}
+	// If the job completed before the pause took effect, leave
+	// the completed result (and final file) untouched, like
+	// Cancel does.
+	if j.download.Status == domain.StatusCompleted {
+		j.pausing = false
+		s.mu.Unlock()
+		return nil
+	}
+	// run() parks the job in paused itself when it sees the flag;
+	// this is the normal path and the flag is already cleared
+	// there.
+	if j.download.Status == domain.StatusPaused {
+		s.mu.Unlock()
+		return nil
+	}
+	// Backstop: if run() left the job in a state Pause can still
+	// park, park it now. A forbidden move out of a terminal state
+	// is refused and that state stands.
+	j.pausing = false
+	if err := s.setStatusLocked(j, domain.StatusPaused); err != nil {
+		s.mu.Unlock()
+		s.notify()
+		return nil
+	}
+	j.download.SpeedBytesPerSec = 0
+	j.download.ETASeconds = -1
+	j.download.UpdatedAt = time.Now().UTC()
+	s.mu.Unlock()
+	s.notify()
+	return nil
+}
+
+// Resume re-queues a paused download from the beginning (U3,
+// Phase 7). Stage 1 has no HTTP Range resume: the next worker
+// starts a fresh single-stream transfer — the engine opens the
+// preserved .part with O_TRUNC, so previously downloaded bytes
+// are fetched again. Resume only works from paused;
+// failed/cancelled jobs use Retry instead.
+func (s *Service) Resume(id string) error {
+	s.mu.Lock()
+	j, ok := s.jobs[id]
+	if !ok {
+		s.mu.Unlock()
+		return domain.ErrDownloadNotFound
+	}
+	if j.download.Status != domain.StatusPaused {
+		st := j.download.Status
+		s.mu.Unlock()
+		return fmt.Errorf("%w: cannot resume job in status %q", domain.ErrInvalidTransition, st)
+	}
+	if s.closed {
+		s.mu.Unlock()
+		return domain.ErrServiceClosed
+	}
+	j.download.ErrorCode = ""
+	j.download.ErrorMessage = ""
+	j.download.SuggestedFilename = ""
+	j.download.DownloadedBytes = 0
+	j.download.SpeedBytesPerSec = 0
+	j.download.ETASeconds = -1
+	if err := s.setStatusLocked(j, domain.StatusQueued); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	j.cancelling = false
+	j.pausing = false
 	j.cancel = nil
 	j.done = nil
 	j.running = false
@@ -894,6 +1070,22 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 			s.mu.Unlock()
 			return
 		}
+		j.pausing = false
+		j.download.SpeedBytesPerSec = 0
+		j.download.ETASeconds = -1
+		j.download.UpdatedAt = time.Now().UTC()
+		s.mu.Unlock()
+		return
+	}
+	if j.pausing {
+		// Pause arrived before the worker started its transfer:
+		// park the job without ever calling the downloader.
+		// probing -> paused is always allowed for a dispatched job.
+		if err := s.setStatusLocked(j, domain.StatusPaused); err != nil {
+			s.mu.Unlock()
+			return
+		}
+		j.pausing = false
 		j.download.SpeedBytesPerSec = 0
 		j.download.ETASeconds = -1
 		j.download.UpdatedAt = time.Now().UTC()
@@ -959,6 +1151,7 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 		if res.Filename != "" {
 			j.download.Filename = res.Filename
 		}
+		j.pausing = false
 		j.download.TempPath = ""
 		j.download.DownloadedBytes = res.WrittenBytes
 		j.download.TotalBytes = res.TotalBytes
@@ -995,10 +1188,28 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 		j.download.TotalBytes = res.TotalBytes
 	}
 
+	// Pause (U3, Phase 7) takes precedence over the generic
+	// cancellation branch below: Pause cancels the same context,
+	// so ctx.Err() is non-nil here, but the job must land in
+	// paused — with its .part preserved (TempPath was recorded
+	// above) — not cancelled. A concurrent Cancel wins over Pause
+	// (the branch below runs when cancelling is set).
+	if j.pausing && !j.cancelling {
+		j.pausing = false
+		// downloading -> paused is always allowed here.
+		_ = s.setStatusLocked(j, domain.StatusPaused)
+		j.download.SpeedBytesPerSec = 0
+		j.download.ETASeconds = -1
+		s.mu.Unlock()
+		s.notify()
+		return
+	}
+
 	// Cancellation (via Cancel or Shutdown) takes precedence.
 	if j.cancelling || ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		// downloading -> cancelled is always allowed here.
 		_ = s.setStatusLocked(j, domain.StatusCancelled)
+		j.pausing = false
 		j.download.SpeedBytesPerSec = 0
 		j.download.ETASeconds = -1
 		s.mu.Unlock()

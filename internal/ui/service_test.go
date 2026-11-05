@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,14 +22,25 @@ type fakeService struct {
 	cancelCalls   []bool
 	retryCalls    int
 	removeCalls   int
+	pauseCalls    int
+	resumeCalls   int
 	shutdownCalls atomic.Int32
 	listener      func()
+	// addErr / resolveErr / pauseErr / resumeErr are returned by the
+	// matching method when set, so tests can drive failure paths.
+	addErr     error
+	resolveErr error
+	pauseErr   error
+	resumeErr  error
 }
 
 func (f *fakeService) AddDownload(req AddRequest) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.adds = append(f.adds, req)
+	if f.addErr != nil {
+		return "", f.addErr
+	}
 	return "fake-id", nil
 }
 
@@ -57,7 +69,21 @@ func (f *fakeService) ResolveConflict(_ string, res Resolution) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.resolveCalls = append(f.resolveCalls, res)
-	return nil
+	return f.resolveErr
+}
+
+func (f *fakeService) Pause(_ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pauseCalls++
+	return f.pauseErr
+}
+
+func (f *fakeService) Resume(_ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resumeCalls++
+	return f.resumeErr
 }
 
 func (f *fakeService) List() []DownloadSnapshot { return nil }
@@ -113,5 +139,37 @@ func TestRedactedURLNeverLeaksTokens(t *testing.T) {
 		if strings.Contains(redacted, "@") {
 			t.Errorf("RedactURL(%q) = %q still contains @", raw, redacted)
 		}
+	}
+}
+
+// TestNoopServicePauseResume (Phase 7, U3): the test double parks an
+// active snapshot in paused and re-queues it, and refuses both
+// operations in the wrong states.
+func TestNoopServicePauseResume(t *testing.T) {
+	svc := NewNoopService()
+	id, err := svc.AddDownload(AddRequest{URL: "http://example.com/f.bin", DestinationDir: "/tmp", Filename: "f.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Resume(id); err == nil {
+		t.Error("Resume on a queued download should fail")
+	}
+	if err := svc.Pause(id); err != nil {
+		t.Fatalf("Pause = %v", err)
+	}
+	if got := svc.List()[0].Status; got != StatusPaused {
+		t.Fatalf("Status = %q, want paused", got)
+	}
+	if err := svc.Pause(id); err == nil {
+		t.Error("second Pause should fail")
+	}
+	if err := svc.Resume(id); err != nil {
+		t.Fatalf("Resume = %v", err)
+	}
+	if got := svc.List()[0].Status; got != StatusQueued {
+		t.Fatalf("Status = %q, want queued", got)
+	}
+	if err := svc.Pause("no-such-id"); !errors.Is(err, domain.ErrDownloadNotFound) {
+		t.Fatalf("Pause unknown id = %v, want ErrDownloadNotFound", err)
 	}
 }
