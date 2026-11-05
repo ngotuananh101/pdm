@@ -24,6 +24,13 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if j.done != nil {
 			dones = append(dones, j.done)
 		}
+		// A ResolveConflict in flight is not a running worker
+		// (running == false while it finalizes), but its rename
+		// must finish before the process exits: wait for its done
+		// channel in the same deadline as the workers (A3).
+		if j.resolveDone != nil {
+			dones = append(dones, j.resolveDone)
+		}
 	}
 	s.mu.Unlock()
 

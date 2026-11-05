@@ -1357,3 +1357,271 @@ func TestServiceEnforcesCanTransition(t *testing.T) {
 		_ = svc.Shutdown(context.Background())
 	})
 }
+
+// cancelRetryStub is the Phase 2 (A2) race stub: the first Download
+// blocks until its context is cancelled (the Cancel path); the second
+// Download (the retried generation) blocks until release2 is closed,
+// then succeeds. That lets the test hold the retried worker in
+// "downloading" while a stale Cancel wakes up, so a stale Cancel
+// that overwrites the new generation is observed instead of being
+// masked by the worker finishing first.
+type cancelRetryStub struct {
+	mu       sync.Mutex
+	calls    int
+	started2 chan struct{}
+	release2 chan struct{}
+}
+
+func (s *cancelRetryStub) Download(ctx context.Context, req domain.TransferRequest) (domain.TransferResult, error) {
+	s.mu.Lock()
+	s.calls++
+	n := s.calls
+	s.mu.Unlock()
+	if n == 1 {
+		<-ctx.Done()
+		return domain.TransferResult{}, ctx.Err()
+	}
+	select {
+	case s.started2 <- struct{}{}:
+	default:
+	}
+	<-s.release2
+	return domain.TransferResult{
+		FinalPath:    filepath.Join(req.DestinationDir, "file.bin"),
+		Filename:     "file.bin",
+		WrittenBytes: 4,
+		TotalBytes:   4,
+	}, nil
+}
+
+func (s *cancelRetryStub) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// TestCancelRetryRace (Phase 2, A2) asserts a stale Cancel cannot
+// kill a retried generation: Cancel the running job, Retry it as
+// soon as it reports cancelled, hold the new worker blocked, then
+// let it finish. The retried job must complete; if the old Cancel
+// wakes up after the Retry and stamps the new generation cancelled,
+// the worker later fails (cancelled -> finalizing is forbidden) and
+// the job never completes.
+func TestCancelRetryRace(t *testing.T) {
+	for iter := 0; iter < 30; iter++ {
+		cfg := testConfig(t)
+		stub := &cancelRetryStub{started2: make(chan struct{}, 1), release2: make(chan struct{})}
+		svc := NewService(cfg, stub)
+		dir := t.TempDir()
+		id, err := svc.AddDownload(AddRequest{
+			URL:            "http://example.com/file.bin",
+			DestinationDir: dir,
+			Resolution:     domain.ResolutionAutoRename,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, func() bool {
+			// Wait for downloading (not just probing): the worker
+			// must have passed its initial cancelling check, so the
+			// first Download call really happens. Waiting only for
+			// probing lets run() exit early via the cancelling check
+			// without ever calling the stub, which would shift the
+			// stub's generation count by one.
+			return getJob(svc, id).Status == domain.StatusDownloading
+		}, "downloading")
+
+		cancelErr := make(chan error, 1)
+		go func() { cancelErr <- svc.Cancel(id, false) }()
+		// Retry as soon as the job reports cancelled: the retry must
+		// slip in between the old worker exiting and the stale
+		// Cancel waking up from <-done.
+		retryErr := make(chan error, 1)
+		go func() {
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				if err := svc.Retry(id); err == nil {
+					retryErr <- nil
+					return
+				}
+				runtime.Gosched()
+			}
+			retryErr <- errors.New("retry never succeeded")
+		}()
+
+		select {
+		case err := <-retryErr:
+			if err != nil {
+				t.Fatalf("iter %d: %v", iter, err)
+			}
+		case <-time.After(6 * time.Second):
+			t.Fatalf("iter %d: retry goroutine did not return", iter)
+		}
+		// The retried worker must be running (and blocked on
+		// release2) before the stale Cancel can be judged.
+		select {
+		case <-stub.started2:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iter %d: retried worker never started", iter)
+		}
+		close(stub.release2)
+		// Fail fast if the job lands in a terminal state other than
+		// completed (a stale Cancel stamps it cancelled, the worker
+		// then fails on cancelled -> finalizing).
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			snap := getJob(svc, id)
+			if snap.Status == domain.StatusCompleted {
+				break
+			}
+			if snap.Status == domain.StatusFailed || snap.Status == domain.StatusCancelled {
+				t.Fatalf("iter %d: Status = %q, want completed (stale Cancel overwrote the retried job)", iter, snap.Status)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("iter %d: timeout waiting for completed, status = %q", iter, snap.Status)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		select {
+		case err := <-cancelErr:
+			if err != nil {
+				t.Fatalf("iter %d: Cancel = %v", iter, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iter %d: Cancel did not return", iter)
+		}
+		if n := stub.callCount(); n != 2 {
+			t.Fatalf("iter %d: stub calls = %d, want 2", iter, n)
+		}
+		_ = svc.Shutdown(context.Background())
+	}
+}
+
+// TestShutdownWaitsForResolveConflict (Phase 2, A3) asserts Shutdown
+// does not return while a ResolveConflict rename is still in
+// flight: it must wait for the resolve (or the context deadline),
+// not return at once as it did when it only watched worker done
+// channels (a resolving job has running == false).
+//
+// The rename itself is a fast local call with no injection point,
+// so the test holds the resolve's done channel directly (same
+// package) to simulate a resolve in flight; what is under test is
+// that Shutdown collects and waits on that channel.
+func TestShutdownWaitsForResolveConflict(t *testing.T) {
+	cfg := testConfig(t)
+	content := []byte("resolve-shutdown")
+	stub := &callCountingStub{inner: &preservedPartStub{content: content}}
+	svc := NewService(cfg, stub)
+	dir := t.TempDir()
+	existing := filepath.Join(dir, "cdfile.bin")
+	if err := os.WriteFile(existing, []byte("existing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	id, err := svc.AddDownload(AddRequest{
+		URL:            "http://example.com/download",
+		DestinationDir: dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return getJob(svc, id).Status == domain.StatusFailed }, "failed on conflict")
+
+	resolveDone := make(chan struct{})
+	svc.mu.Lock()
+	j := svc.jobs[id]
+	j.resolving = true
+	j.resolveDone = resolveDone
+	svc.mu.Unlock()
+
+	// Shutdown with a short deadline must time out while the resolve
+	// is still in flight, not return at once.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := svc.Shutdown(ctx); err == nil {
+		t.Fatal("Shutdown returned nil while a ResolveConflict was still in flight")
+	}
+	if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
+		t.Fatalf("Shutdown returned after %v, want it to wait for the resolve (or the deadline)", elapsed)
+	}
+
+	// Once the resolve finishes, Shutdown returns.
+	close(resolveDone)
+	if err := svc.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown after resolve finished = %v", err)
+	}
+	svc.mu.Lock()
+	j.resolving = false
+	j.resolveDone = nil
+	svc.mu.Unlock()
+	_ = svc.Shutdown(context.Background())
+}
+
+// TestCancelResolveConflictRace (Phase 2, A3) asserts Cancel and
+// ResolveConflict racing on a file_conflict job have exactly one
+// winner: either the resolve wins (completed, destination file
+// created from the preserved .part) or the cancel wins (cancelled,
+// destination file never created). The resolve must never overwrite
+// a cancel by renaming the .part after Cancel stamped the job
+// cancelled, and a cancel must never leave a half-created
+// destination file behind.
+func TestCancelResolveConflictRace(t *testing.T) {
+	for iter := 0; iter < 30; iter++ {
+		cfg := testConfig(t)
+		content := []byte("race-part-content")
+		stub := &callCountingStub{inner: &preservedPartStub{content: content}}
+		svc := NewService(cfg, stub)
+		dir := t.TempDir()
+		existing := filepath.Join(dir, "cdfile.bin")
+		if err := os.WriteFile(existing, []byte("existing"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		id, err := svc.AddDownload(AddRequest{
+			URL:            "http://example.com/download",
+			DestinationDir: dir,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, func() bool { return getJob(svc, id).Status == domain.StatusFailed }, "failed on conflict")
+		if got := getJob(svc, id).ErrorCode; got != domain.ErrorCodeFileConflict {
+			t.Fatalf("iter %d: ErrorCode = %q, want file_conflict", iter, got)
+		}
+
+		var wg sync.WaitGroup
+		var resolveErr, cancelErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			resolveErr = svc.ResolveConflict(id, domain.ResolutionAutoRename)
+		}()
+		go func() {
+			defer wg.Done()
+			cancelErr = svc.Cancel(id, false)
+		}()
+		wg.Wait()
+
+		snap := getJob(svc, id)
+		renamed := filepath.Join(dir, "cdfile (1).bin")
+		switch snap.Status {
+		case domain.StatusCompleted:
+			if resolveErr != nil {
+				t.Fatalf("iter %d: completed but ResolveConflict = %v (cancel err: %v)", iter, resolveErr, cancelErr)
+			}
+			got, err := os.ReadFile(renamed)
+			if err != nil {
+				t.Fatalf("iter %d: resolve won but destination file missing: %v", iter, err)
+			}
+			if string(got) != string(content) {
+				t.Fatalf("iter %d: destination content = %q, want preserved .part content", iter, got)
+			}
+		case domain.StatusCancelled:
+			if _, err := os.Stat(renamed); err == nil {
+				t.Fatalf("iter %d: cancel won but destination file was created", iter)
+			}
+		default:
+			t.Fatalf("iter %d: Status = %q, want completed or cancelled (resolve err: %v, cancel err: %v)", iter, snap.Status, resolveErr, cancelErr)
+		}
+		_ = svc.Shutdown(context.Background())
+	}
+}

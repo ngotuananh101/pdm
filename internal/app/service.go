@@ -49,6 +49,14 @@ type job struct {
 	running    bool
 	cancelling bool
 
+	// resolving is true while a ResolveConflict finalize is in
+	// flight (status finalizing, rename running outside mu).
+	// resolveDone is closed when that ResolveConflict returns, so
+	// Cancel and Shutdown can wait for the rename instead of
+	// racing it.
+	resolving   bool
+	resolveDone chan struct{}
+
 	// Speed tracking: last observed byte count and time.
 	lastBytes int64
 	lastTime  time.Time
@@ -296,6 +304,28 @@ func (s *Service) List() []domain.DownloadSnapshot {
 // .part file is removed only after the worker goroutine has fully
 // exited (<-job.done), so deletion is safe on Windows.
 func (s *Service) Cancel(id string, deleteTemp bool) error {
+	// If a ResolveConflict is finalizing this job, wait for it to
+	// finish before deciding: the resolve owns the rename, and a
+	// Cancel decided mid-rename could only lose to it. Waiting
+	// also serializes Cancel/ResolveConflict per job (ARCH §4).
+	// The loop re-checks after each resolve, in case the job went
+	// back to file_conflict and another resolve started.
+	for {
+		s.mu.Lock()
+		j, ok := s.jobs[id]
+		if !ok {
+			s.mu.Unlock()
+			return domain.ErrDownloadNotFound
+		}
+		if !j.resolving || j.resolveDone == nil {
+			s.mu.Unlock()
+			break
+		}
+		rd := j.resolveDone
+		s.mu.Unlock()
+		<-rd
+	}
+
 	s.mu.Lock()
 	j, ok := s.jobs[id]
 	if !ok {
@@ -307,8 +337,13 @@ func (s *Service) Cancel(id string, deleteTemp bool) error {
 		return nil
 	}
 	if !j.download.Status.IsActive() {
+		// Capture the status while holding mu: the error below is
+		// formatted after Unlock, and run() may change the status
+		// concurrently (same post-Unlock read Phase 1 fixed in
+		// Remove).
+		st := j.download.Status
 		s.mu.Unlock()
-		return fmt.Errorf("%w: cannot cancel job in status %q", domain.ErrInvalidTransition, j.download.Status)
+		return fmt.Errorf("%w: cannot cancel job in status %q", domain.ErrInvalidTransition, st)
 	}
 	if !j.running {
 		// Queued but not yet dispatched: no worker goroutine exists,
@@ -329,7 +364,11 @@ func (s *Service) Cancel(id string, deleteTemp bool) error {
 				return err
 			}
 			s.mu.Lock()
-			if jj, ok := s.jobs[id]; ok && jj.download.TempPath == tempPath {
+			if jj, ok := s.jobs[id]; ok && jj.download.Status == domain.StatusCancelled && jj.download.TempPath == tempPath {
+				// Only clear the .part path while the job is still
+				// the cancelled generation this Cancel created: a
+				// Retry in between may have re-queued the job and
+				// the new worker may reuse the same temp path.
 				jj.download.TempPath = ""
 			}
 			s.mu.Unlock()
@@ -355,6 +394,15 @@ func (s *Service) Cancel(id string, deleteTemp bool) error {
 		s.mu.Unlock()
 		return domain.ErrDownloadNotFound
 	}
+	// Generation check (A2): if a Retry has started a new generation
+	// since this Cancel began (Retry resets done, then dispatch
+	// installs a fresh channel), the old Cancel must not touch the
+	// new job's status or its .part file. The new generation owns
+	// its own lifecycle.
+	if j.done != done {
+		s.mu.Unlock()
+		return nil
+	}
 	// If the job already completed before the cancel took effect,
 	// leave the completed result (and final file) untouched.
 	if j.download.Status == domain.StatusCompleted {
@@ -378,6 +426,14 @@ func (s *Service) Cancel(id string, deleteTemp bool) error {
 	if !ok {
 		s.mu.Unlock()
 		return domain.ErrDownloadNotFound
+	}
+	// Generation check again (A2): a Retry may have slipped in
+	// while this Cancel was removing the .part file outside the
+	// lock. Never stamp the new generation cancelled, and never
+	// clear its TempPath.
+	if j.done != done {
+		s.mu.Unlock()
+		return nil
 	}
 	if j.download.Status == domain.StatusCompleted {
 		s.mu.Unlock()
@@ -414,8 +470,13 @@ func (s *Service) Retry(id string) error {
 		return domain.ErrDownloadNotFound
 	}
 	if j.download.Status != domain.StatusFailed && j.download.Status != domain.StatusCancelled {
+		// Capture the status while holding mu: the error below is
+		// formatted after Unlock, and run() may change the status
+		// concurrently (same post-Unlock read Phase 1 fixed in
+		// Remove; found by TestCancelRetryRace under -race).
+		st := j.download.Status
 		s.mu.Unlock()
-		return fmt.Errorf("%w: cannot retry job in status %q", domain.ErrInvalidTransition, j.download.Status)
+		return fmt.Errorf("%w: cannot retry job in status %q", domain.ErrInvalidTransition, st)
 	}
 	if s.closed {
 		s.mu.Unlock()
@@ -490,6 +551,20 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 		s.mu.Unlock()
 		return fmt.Errorf("%w: job %q is not waiting on a file conflict", domain.ErrInvalidTransition, id)
 	}
+	// Mark the resolve in flight (A3, like run's done channel):
+	// Cancel waits on resolveDone instead of racing the rename,
+	// and Shutdown waits for it too. The deferred cleanup runs on
+	// every return below, after the final status is recorded.
+	j.resolving = true
+	resolveDone := make(chan struct{})
+	j.resolveDone = resolveDone
+	defer func() {
+		s.mu.Lock()
+		j.resolving = false
+		j.resolveDone = nil
+		s.mu.Unlock()
+		close(resolveDone)
+	}()
 	switch res {
 	case domain.ResolutionCancel:
 		tempPath := j.download.TempPath
@@ -514,7 +589,11 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 			}
 		}
 		s.mu.Lock()
-		if jj, ok := s.jobs[id]; ok {
+		if jj, ok := s.jobs[id]; ok && jj.download.Status == domain.StatusCancelled && jj.download.TempPath == tempPath {
+			// Only clear the .part path while the job is still the
+			// cancelled generation this resolve created: a Retry
+			// in between may have re-queued the job and the new
+			// worker may reuse the same temp path.
 			jj.download.TempPath = ""
 		}
 		s.mu.Unlock()
@@ -545,7 +624,11 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 				finalPath, finalName, ferr := platform.FinalizeTempFile(tempPath, destDir, filename, mode)
 				if ferr != nil {
 					s.mu.Lock()
-					if jj, ok := s.jobs[id]; ok {
+					if jj, ok := s.jobs[id]; ok && jj.download.Status == domain.StatusFinalizing {
+						// Only record the failure while the job is
+						// still the finalizing generation this
+						// resolve started; otherwise leave the
+						// status to whoever moved it.
 						jj.download.ErrorMessage = domain.SanitizeErrorText(ferr.Error())
 						var fce *domain.FileConflictError
 						if errors.As(ferr, &fce) {
@@ -568,9 +651,13 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 					return ferr
 				}
 				s.mu.Lock()
-				if jj, ok := s.jobs[id]; ok {
-					// The file is already renamed; finalizing ->
-					// completed is always allowed here.
+				if jj, ok := s.jobs[id]; ok && jj.download.Status == domain.StatusFinalizing {
+					// The file is already renamed: complete only
+					// while the job is still the finalizing
+					// generation this resolve started. If another
+					// operation moved it meanwhile, leave that
+					// status untouched instead of overwriting it.
+					// finalizing -> completed is always allowed here.
 					_ = s.setStatusLocked(jj, domain.StatusCompleted)
 					jj.download.FinalPath = finalPath
 					jj.download.Filename = finalName
@@ -600,6 +687,14 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 		if !ok {
 			s.mu.Unlock()
 			return domain.ErrDownloadNotFound
+		}
+		if jj.download.Status != domain.StatusFinalizing {
+			// Another operation moved the job while this resolve
+			// was probing for the .part file; leave its status
+			// untouched instead of forcing it to failed.
+			s.mu.Unlock()
+			s.notify()
+			return nil
 		}
 		jj.download.ErrorCode = ""
 		jj.download.ErrorMessage = "temporary file is missing; retry to download again"
