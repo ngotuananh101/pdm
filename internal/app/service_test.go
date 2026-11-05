@@ -490,6 +490,117 @@ func (c *callCountingStub) Download(ctx context.Context, req domain.TransferRequ
 
 func (c *callCountingStub) calls() int64 { return atomic.LoadInt64(&c.called) }
 
+// syncFailStub simulates a Sync/Close failure in the engine the way
+// the old code reported it: the .part file exists on disk, but the
+// error carries an empty TransferResult, so TempPath is lost.
+// The first call fails; the second (after Retry) succeeds and
+// finalizes, proving the .part is accounted for end to end.
+type syncFailStub struct {
+	mu      sync.Mutex
+	calls   int
+	content []byte
+}
+
+func (s *syncFailStub) Download(ctx context.Context, req domain.TransferRequest) (domain.TransferResult, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	filename := req.Filename
+	if filename == "" {
+		filename = "syncfail.bin"
+	}
+	tempPath := filepath.Join(req.DestinationDir, fmt.Sprintf(".%s.%s.part", filename, req.ID))
+	if call == 1 {
+		if err := os.WriteFile(tempPath, s.content, 0o600); err != nil {
+			return domain.TransferResult{}, err
+		}
+		// Old engine behaviour: Sync/Close errors returned an empty
+		// result, losing TempPath even though the .part is on disk.
+		return domain.TransferResult{}, &engine.CodedError{
+			Code:    string(domain.ErrorCodeFilesystem),
+			Message: "sync temp file: input/output error",
+		}
+	}
+	// Retry: the transfer succeeds; finalize by moving the .part
+	// to its final name, as the engine would.
+	finalPath := filepath.Join(req.DestinationDir, filename)
+	if err := os.WriteFile(tempPath, s.content, 0o600); err != nil {
+		return domain.TransferResult{}, err
+	}
+	if err := os.Rename(tempPath, finalPath); err != nil {
+		return domain.TransferResult{}, err
+	}
+	return domain.TransferResult{
+		FinalPath:    finalPath,
+		Filename:     filename,
+		TempPath:     tempPath,
+		WrittenBytes: int64(len(s.content)),
+		TotalBytes:   int64(len(s.content)),
+	}, nil
+}
+
+// TestSyncCloseFailure_PartIsRecordedNotOrphaned (A6, Phase 3): after
+// a filesystem failure that loses TempPath in the engine result
+// (Sync/Close), the service must still record the .part path so the
+// file is not a silent orphan on disk.
+func TestSyncCloseFailure_PartIsRecordedNotOrphaned(t *testing.T) {
+	cfg := testConfig(t)
+	content := []byte("sync-fail-bytes")
+	stub := &syncFailStub{content: content}
+	svc := NewService(cfg, stub)
+	dir := t.TempDir()
+
+	id, err := svc.AddDownload(AddRequest{
+		URL:            "http://example.com/download",
+		DestinationDir: dir,
+		Filename:       "syncfail.bin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return getJob(svc, id).Status == domain.StatusFailed }, "failed on sync error")
+	snap := getJob(svc, id)
+	if snap.ErrorCode != domain.ErrorCodeFilesystem {
+		t.Fatalf("ErrorCode = %q, want filesystem_error", snap.ErrorCode)
+	}
+	// The .part must be recorded, not silently orphaned: the job
+	// knows the path and the file is still on disk.
+	wantTemp := filepath.Join(dir, ".syncfail.bin."+id+".part")
+	if snap.TempPath != wantTemp {
+		t.Fatalf("TempPath = %q, want %q", snap.TempPath, wantTemp)
+	}
+	data, err := os.ReadFile(snap.TempPath)
+	if err != nil {
+		t.Fatalf(".part not on disk at recorded TempPath: %v", err)
+	}
+	if string(data) != string(content) {
+		t.Fatalf(".part content = %q, want %q", data, content)
+	}
+
+	// Retry over the recorded .part: the second attempt succeeds
+	// and the .part is consumed by finalize, leaving no orphan.
+	if err := svc.Retry(id); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return getJob(svc, id).Status == domain.StatusCompleted }, "completed after retry")
+	snap = getJob(svc, id)
+	if snap.Filename != "syncfail.bin" {
+		t.Fatalf("Filename = %q, want syncfail.bin", snap.Filename)
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".part") {
+			t.Fatalf("leftover .part after retry: %s", e.Name())
+		}
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "syncfail.bin"))
+	if string(got) != string(content) {
+		t.Fatalf("final content = %q, want %q", got, content)
+	}
+	_ = svc.Shutdown(context.Background())
+}
+
 func TestResolveConflictCancel(t *testing.T) {
 	cfg := testConfig(t)
 	content := []byte("payload")

@@ -193,6 +193,7 @@ func (d *SingleDownloader) Download(ctx context.Context, req domain.TransferRequ
 	lastEmit := time.Now()
 
 	var readErr error
+	var writeErr error
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
@@ -204,6 +205,10 @@ func (d *SingleDownloader) Download(ctx context.Context, req domain.TransferRequ
 			stallTimer.Reset(stallTimeout)
 
 			if _, werr := tempFile.Write(buf[:n]); werr != nil {
+				// Track the write failure separately: a failed
+				// temp-file write is a disk error, not a network
+				// error (A6, Phase 3).
+				writeErr = werr
 				readErr = werr
 				break
 			}
@@ -251,28 +256,47 @@ func (d *SingleDownloader) Download(ctx context.Context, req domain.TransferRequ
 			return domain.TransferResult{TempPath: tempPath, Filename: filename, WrittenBytes: totalWritten, TotalBytes: totalBytes}, reqCtx.Err()
 		}
 		// If we overshot Content-Length, treat as size mismatch.
+		// The .part is kept and its path reported: deleting it is
+		// the service's job (single rule, Phase 3), not the
+		// engine's.
 		if errors.Is(readErr, domain.ErrSizeMismatch) {
-			_ = os.Remove(tempPath)
-			return domain.TransferResult{}, codeError(domain.ErrorCodeSizeMismatch, "downloaded more bytes than Content-Length", domain.ErrSizeMismatch)
+			return domain.TransferResult{TempPath: tempPath, Filename: filename, WrittenBytes: totalWritten, TotalBytes: totalBytes}, codeError(domain.ErrorCodeSizeMismatch, "downloaded more bytes than Content-Length", domain.ErrSizeMismatch)
 		}
-		// Other read/write errors.
+		// A failed temp-file write is a disk problem (ENOSPC, EIO,
+		// ...), not a network problem: report filesystem_error so
+		// the caller does not retry it as a network blip.
+		if writeErr != nil {
+			return domain.TransferResult{TempPath: tempPath, Filename: filename, WrittenBytes: totalWritten, TotalBytes: totalBytes}, codeError(domain.ErrorCodeFilesystem, "write temp file: "+writeErr.Error(), writeErr)
+		}
+		// The body ended before Content-Length was satisfied: the
+		// transfer is short, not broken mid-stream. Only when a
+		// length was declared; without one there is nothing to
+		// mismatch against, so it stays a network error below.
+		if totalBytes >= 0 && errors.Is(readErr, io.ErrUnexpectedEOF) {
+			return domain.TransferResult{TempPath: tempPath, Filename: filename, WrittenBytes: totalWritten, TotalBytes: totalBytes}, codeError(domain.ErrorCodeSizeMismatch, fmt.Sprintf("size mismatch: wrote %d, expected %d", totalWritten, totalBytes), domain.ErrSizeMismatch)
+		}
+		// Other read errors.
 		return domain.TransferResult{TempPath: tempPath, Filename: filename, WrittenBytes: totalWritten, TotalBytes: totalBytes}, codeError(domain.ErrorCodeNetwork, "transfer: "+readErr.Error(), readErr)
 	}
 
-	// Verify exact size.
+	// Verify exact size. The .part is kept and its path reported
+	// (single cleanup rule, Phase 3): the service decides whether
+	// to keep it for retry or delete it on the user's choice.
 	if totalBytes >= 0 && totalWritten != totalBytes {
 		_ = tempFile.Close()
-		_ = os.Remove(tempPath)
-		return domain.TransferResult{}, codeError(domain.ErrorCodeSizeMismatch, fmt.Sprintf("size mismatch: wrote %d, expected %d", totalWritten, totalBytes), domain.ErrSizeMismatch)
+		return domain.TransferResult{TempPath: tempPath, Filename: filename, WrittenBytes: totalWritten, TotalBytes: totalBytes}, codeError(domain.ErrorCodeSizeMismatch, fmt.Sprintf("size mismatch: wrote %d, expected %d", totalWritten, totalBytes), domain.ErrSizeMismatch)
 	}
 
 	// Durability: sync and close, checking both errors before rename.
+	// Both returns carry TempPath (A6, Phase 3): the .part stays on
+	// disk and the caller must be able to find it to retry or
+	// delete it.
 	if err := tempFile.Sync(); err != nil {
 		_ = tempFile.Close()
-		return domain.TransferResult{}, codeError(domain.ErrorCodeFilesystem, "sync temp file: "+err.Error(), err)
+		return domain.TransferResult{TempPath: tempPath, Filename: filename, WrittenBytes: totalWritten, TotalBytes: totalBytes}, codeError(domain.ErrorCodeFilesystem, "sync temp file: "+err.Error(), err)
 	}
 	if err := tempFile.Close(); err != nil {
-		return domain.TransferResult{}, codeError(domain.ErrorCodeFilesystem, "close temp file: "+err.Error(), err)
+		return domain.TransferResult{TempPath: tempPath, Filename: filename, WrittenBytes: totalWritten, TotalBytes: totalBytes}, codeError(domain.ErrorCodeFilesystem, "close temp file: "+err.Error(), err)
 	}
 
 	// Finalize.

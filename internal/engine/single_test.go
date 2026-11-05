@@ -292,22 +292,32 @@ func TestDownload_TruncatedBody(t *testing.T) {
 	dest := t.TempDir()
 	cfg := testConfig()
 	dl := NewSingleDownloader(cfg, NewHTTPClient(cfg))
-	_, err := dl.Download(context.Background(), domain.TransferRequest{
+	res, err := dl.Download(context.Background(), domain.TransferRequest{
 		ID: "t6", URL: srv.URL + "/trunc.bin", DestinationDir: dest, Mode: domain.FinalizeOverwrite,
 	})
 	if err == nil {
 		t.Fatalf("expected error for truncated body, got nil")
 	}
-	if !errors.Is(err, domain.ErrSizeMismatch) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
-		// Accept CodedError wrapping ErrSizeMismatch at minimum; fail otherwise.
-		var ce *CodedError
-		if errors.As(err, &ce) {
-			if ce.Code != string(domain.ErrorCodeSizeMismatch) && ce.Code != string(domain.ErrorCodeNetwork) {
-				t.Fatalf("error code = %s, want size_mismatch or network_error; err=%v", ce.Code, err)
-			}
-		} else {
-			t.Fatalf("unexpected error: %v", err)
-		}
+	// A6 (Phase 3): a body cut short of Content-Length is a size
+	// mismatch, not a network error, and never a bare UnexpectedEOF.
+	var ce *CodedError
+	if !errors.As(err, &ce) {
+		t.Fatalf("expected CodedError, got %T: %v", err, err)
+	}
+	if ce.Code != string(domain.ErrorCodeSizeMismatch) {
+		t.Fatalf("error code = %s, want size_mismatch; err=%v", ce.Code, err)
+	}
+	if !errors.Is(err, domain.ErrSizeMismatch) {
+		t.Fatalf("err does not wrap ErrSizeMismatch: %v", err)
+	}
+	// The .part is kept and its path reported: cleanup is the
+	// service's job (single rule, Phase 3); the engine must not
+	// silently delete it or lose the path.
+	if res.TempPath == "" {
+		t.Fatal("TempPath empty alongside size_mismatch error")
+	}
+	if _, statErr := os.Stat(res.TempPath); statErr != nil {
+		t.Fatalf(".part not preserved after truncated body: %v", statErr)
 	}
 	// No final file should have been created.
 	entries, _ := os.ReadDir(dest)
@@ -315,6 +325,137 @@ func TestDownload_TruncatedBody(t *testing.T) {
 		if !strings.HasSuffix(e.Name(), ".part") {
 			t.Fatalf("final file created despite truncation: %s", e.Name())
 		}
+	}
+}
+
+// --- Test 6b (A6, Phase 3): Disk write failure ---------------------------
+// /dev/full accepts open but fails every write with ENOSPC, so it
+// simulates a full disk after the temp file was created. The error
+// must be classified filesystem_error, never network_error.
+func TestDownload_WriteError_IsFilesystemError(t *testing.T) {
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skipf("/dev/full unavailable: %v", err)
+	}
+	body := []byte("some payload that will not fit on a full disk")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	dest := t.TempDir()
+	cfg := testConfig()
+	dl := NewSingleDownloader(cfg, NewHTTPClient(cfg))
+	res, err := dl.Download(context.Background(), domain.TransferRequest{
+		ID: "t6b", URL: srv.URL + "/full.bin", DestinationDir: dest,
+		Filename: "full.bin", TempPath: "/dev/full", Mode: domain.FinalizeOverwrite,
+	})
+	if err == nil {
+		t.Fatal("expected error for unwritable temp file, got nil")
+	}
+	var ce *CodedError
+	if !errors.As(err, &ce) {
+		t.Fatalf("expected CodedError, got %T: %v", err, err)
+	}
+	if ce.Code != string(domain.ErrorCodeFilesystem) {
+		t.Fatalf("error code = %s, want filesystem_error; err=%v", ce.Code, err)
+	}
+	// The .part path must still be reported so the caller can
+	// account for it (nothing to delete on /dev/full, but the path
+	// must not be silently lost).
+	if res.TempPath != "/dev/full" {
+		t.Fatalf("TempPath = %q, want /dev/full", res.TempPath)
+	}
+}
+
+// roundTripFunc adapts a func to http.RoundTripper for tests that need
+// a response body the real transport cannot produce (a body longer
+// than the declared Content-Length, or a clean EOF short of it).
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestDownload_OvershootContentLength_PreservesTempPath covers the
+// "more bytes than Content-Length" branch (A6, Phase 3): it must
+// report size_mismatch and keep the .part path instead of returning
+// an empty TransferResult.
+func TestDownload_OvershootContentLength_PreservesTempPath(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			ContentLength: 5,
+			Header:        make(http.Header),
+			Body:          io.NopCloser(strings.NewReader("0123456789")),
+			Request:       r,
+		}, nil
+	})
+	dest := t.TempDir()
+	cfg := testConfig()
+	dl := NewSingleDownloader(cfg, &http.Client{Transport: transport})
+	res, err := dl.Download(context.Background(), domain.TransferRequest{
+		ID: "t6c", URL: "http://example.com/file.bin", DestinationDir: dest,
+		Filename: "file.bin", Mode: domain.FinalizeOverwrite,
+	})
+	if err == nil {
+		t.Fatal("expected error for overshoot body, got nil")
+	}
+	var ce *CodedError
+	if !errors.As(err, &ce) {
+		t.Fatalf("expected CodedError, got %T: %v", err, err)
+	}
+	if ce.Code != string(domain.ErrorCodeSizeMismatch) {
+		t.Fatalf("error code = %s, want size_mismatch; err=%v", ce.Code, err)
+	}
+	if !errors.Is(err, domain.ErrSizeMismatch) {
+		t.Fatalf("err does not wrap ErrSizeMismatch: %v", err)
+	}
+	if res.TempPath == "" {
+		t.Fatal("TempPath empty alongside size_mismatch error")
+	}
+	if _, statErr := os.Stat(res.TempPath); statErr != nil {
+		t.Fatalf(".part not preserved after overshoot: %v", statErr)
+	}
+}
+
+// TestDownload_ShortBodyCleanEOF_PreservesTempPath covers the
+// exact-size verification branch (A6, Phase 3): a clean EOF with
+// fewer bytes than Content-Length must report size_mismatch and
+// keep the .part path instead of returning an empty TransferResult.
+func TestDownload_ShortBodyCleanEOF_PreservesTempPath(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			ContentLength: 1000,
+			Header:        make(http.Header),
+			Body:          io.NopCloser(strings.NewReader("short")),
+			Request:       r,
+		}, nil
+	})
+	dest := t.TempDir()
+	cfg := testConfig()
+	dl := NewSingleDownloader(cfg, &http.Client{Transport: transport})
+	res, err := dl.Download(context.Background(), domain.TransferRequest{
+		ID: "t6d", URL: "http://example.com/file.bin", DestinationDir: dest,
+		Filename: "file.bin", Mode: domain.FinalizeOverwrite,
+	})
+	if err == nil {
+		t.Fatal("expected error for short body, got nil")
+	}
+	var ce *CodedError
+	if !errors.As(err, &ce) {
+		t.Fatalf("expected CodedError, got %T: %v", err, err)
+	}
+	if ce.Code != string(domain.ErrorCodeSizeMismatch) {
+		t.Fatalf("error code = %s, want size_mismatch; err=%v", ce.Code, err)
+	}
+	if !errors.Is(err, domain.ErrSizeMismatch) {
+		t.Fatalf("err does not wrap ErrSizeMismatch: %v", err)
+	}
+	if res.TempPath == "" {
+		t.Fatal("TempPath empty alongside size_mismatch error")
+	}
+	if _, statErr := os.Stat(res.TempPath); statErr != nil {
+		t.Fatalf(".part not preserved after short body: %v", statErr)
 	}
 }
 

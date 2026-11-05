@@ -300,6 +300,23 @@ func (s *Service) List() []domain.DownloadSnapshot {
 	return out
 }
 
+// removeTempPart deletes the .part file at path. It is the single
+// place that removes a .part file (A6, Phase 3): run() never deletes
+// one, so a failed job's .part is removed only when the user
+// explicitly chooses to delete it (Cancel with deleteTemp, or
+// ResolveConflict Cancel). A file that is already gone (e.g. a
+// previous delete won a race) is not an error; any other removal
+// failure is reported to the caller.
+func removeTempPart(path string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // Cancel stops an active download. When deleteTemp is true the
 // .part file is removed only after the worker goroutine has fully
 // exited (<-job.done), so deletion is safe on Windows.
@@ -359,7 +376,7 @@ func (s *Service) Cancel(id string, deleteTemp bool) error {
 		s.mu.Unlock()
 
 		if deleteTemp && tempPath != "" {
-			if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := removeTempPart(tempPath); err != nil {
 				s.notify()
 				return err
 			}
@@ -416,7 +433,7 @@ func (s *Service) Cancel(id string, deleteTemp bool) error {
 	s.mu.Unlock()
 
 	if deleteTemp && tempPath != "" {
-		if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removeTempPart(tempPath); err != nil {
 			return err
 		}
 	}
@@ -584,7 +601,7 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 		j.download.UpdatedAt = time.Now().UTC()
 		s.mu.Unlock()
 		if tempPath != "" {
-			if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := removeTempPart(tempPath); err != nil {
 				return err
 			}
 		}
@@ -968,7 +985,23 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 
 	// downloading -> failed is always allowed here.
 	_ = s.setStatusLocked(j, domain.StatusFailed)
-	j.download.ErrorCode = errorCodeFor(err)
+	// .part lifecycle (A6, Phase 3) — single rule, owned here:
+	// run() never deletes a .part file. A failure keeps the .part
+	// when the error is transient (network, 5xx, rate limit) so
+	// Retry can reuse it, and a terminal failure also keeps the
+	// recorded path; the file is removed only when the user
+	// explicitly chooses to delete it (Cancel with deleteTemp, or
+	// ResolveConflict Cancel), via removeTempPart.
+	// Backstop: if the engine failed after creating the temp file
+	// but returned no TempPath (e.g. a Sync/Close failure), record
+	// the conventional path so the file is never a silent orphan:
+	// filesystem and size errors are the ones that imply a temp
+	// file may exist on disk.
+	code := errorCodeFor(err)
+	if j.download.TempPath == "" && (code == domain.ErrorCodeFilesystem || code == domain.ErrorCodeSizeMismatch) && j.download.Filename != "" && j.download.DestinationDir != "" {
+		j.download.TempPath = filepath.Join(j.download.DestinationDir, fmt.Sprintf(".%s.%s.part", j.download.Filename, id))
+	}
+	j.download.ErrorCode = code
 	j.download.ErrorMessage = domain.SanitizeErrorText(err.Error())
 	j.download.SpeedBytesPerSec = 0
 	j.download.ETASeconds = -1
