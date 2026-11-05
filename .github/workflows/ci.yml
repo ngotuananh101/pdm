@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc pkg-config libgl1-mesa-dev xorg-dev libxkbcommon-dev libwayland-dev
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Vet (wayland)
+        run: go vet -tags wayland ./...
+
+      - name: Test (X11)
+        run: go test -race ./...
+
+      - name: Test (Wayland)
+        run: go test -race -tags wayland ./...
+
+      - name: Build (X11)
+        run: go build -v ./cmd/pdm
+
+      - name: Build (Wayland)
+        run: go build -tags wayland -v ./cmd/pdm
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Add MSYS2/MinGW gcc to PATH
+        shell: bash
+        run: echo "C:/msys64/mingw64/bin" >> $GITHUB_PATH
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Build
+        run: go build -v -o pdm.exe ./cmd/pdm

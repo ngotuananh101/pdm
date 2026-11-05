@@ -1,0 +1,18 @@
+# Build output and local app data
+/pdm
+/bin/
+/dist/
+/build/
+*.exe
+*.test
+*.out
+*.db
+*.db-shm
+*.db-wal
+*.part
+.DS_Store
+
+# Local workspace metadata
+.remember/
+.claude/
+.superpowers/

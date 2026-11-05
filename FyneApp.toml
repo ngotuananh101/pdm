@@ -1,0 +1,8 @@
+[Details]
+Name = "Ponta Download Manager"
+ID = "com.ponta.pdm"
+Version = "0.1.0"
+Build = 1
+
+[Migrations]
+fyneDo = true
