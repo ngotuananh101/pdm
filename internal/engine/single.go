@@ -19,6 +19,10 @@ import (
 type SingleDownloader struct {
 	cfg    config.Config
 	client *http.Client
+
+	// sleep waits out a retry backoff. It defaults to time.Sleep;
+	// tests override it to observe waits without waiting in real time.
+	sleep func(time.Duration)
 }
 
 // NewSingleDownloader creates a downloader using the given config and client.
@@ -30,14 +34,66 @@ func NewSingleDownloader(cfg config.Config, client *http.Client) *SingleDownload
 }
 
 // Download performs a single-stream GET, writes to a temp file, and
-// finalizes it according to req.Mode.
+// finalizes it according to req.Mode, with bounded retries for
+// transient failures (A4, Phase 6). At most cfg.MaxRetries attempts
+// are made in total (at least one); only network errors, 429/503 and
+// other 5xx are retried, with exponential backoff plus jitter, and a
+// Retry-After header is honored as a minimum wait. Auth failures,
+// 404s, size mismatches, filesystem errors and cancellations fail
+// immediately. Each attempt restarts from scratch (Stage 1 has no
+// resume) and re-opens the .part file with O_TRUNC.
+func (d *SingleDownloader) Download(ctx context.Context, req domain.TransferRequest) (domain.TransferResult, error) {
+	maxAttempts := d.cfg.MaxRetries
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	var lastRes domain.TransferResult
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		res, err := d.downloadOnce(ctx, req)
+		if err == nil {
+			return res, nil
+		}
+		lastRes, lastErr = res, err
+		if !isRetryableError(err) || attempt == maxAttempts-1 {
+			return res, err
+		}
+		if err := d.sleepCtx(ctx, retryDelay(attempt, err)); err != nil {
+			return lastRes, err
+		}
+	}
+	return lastRes, lastErr
+}
+
+// sleepCtx waits dur (via d.sleep when set, else time.Sleep) unless
+// ctx is cancelled first.
+func (d *SingleDownloader) sleepCtx(ctx context.Context, dur time.Duration) error {
+	if dur <= 0 {
+		return ctx.Err()
+	}
+	if d.sleep != nil {
+		d.sleep(dur)
+		return ctx.Err()
+	}
+	t := time.NewTimer(dur)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// downloadOnce performs a single attempt of Download: one GET,
+// written to a temp file and finalized according to req.Mode.
 //
 // Stall handling: a stall-aware context (context.WithCancelCause) is
 // created and a resettable timer (time.AfterFunc) fires after
 // cfg.StallTimeout of no progress, canceling with a CodedError cause.
 // The timer is reset on every successful read > 0 and always Stop()ed
 // via defer so no timers or goroutines leak.
-func (d *SingleDownloader) Download(ctx context.Context, req domain.TransferRequest) (domain.TransferResult, error) {
+func (d *SingleDownloader) downloadOnce(ctx context.Context, req domain.TransferRequest) (domain.TransferResult, error) {
 	// Validate URL.
 	parsedURL, err := platform.ValidateHTTPURL(req.URL)
 	if err != nil {
@@ -105,7 +161,11 @@ func (d *SingleDownloader) Download(ctx context.Context, req domain.TransferRequ
 			}
 		}
 		msg := fmt.Sprintf("HTTP %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
-		return domain.TransferResult{}, codeError(code, msg, nil)
+		ce := codeError(code, msg, nil)
+		// A Retry-After on a retryable status is honored as a
+		// minimum wait before the next attempt (A4).
+		ce.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+		return domain.TransferResult{}, ce
 	}
 
 	// Resolve effective filename.

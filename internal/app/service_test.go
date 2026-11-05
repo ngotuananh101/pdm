@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -771,11 +772,14 @@ func TestCancelDeleteTempPreservesPart(t *testing.T) {
 
 func TestRetryAndRemove(t *testing.T) {
 	cfg := testConfig(t)
-	// Server that fails first, succeeds later.
+	// Server that fails the first MaxRetries requests, succeeds
+	// later. A4 (Phase 6): the engine auto-retries transient 500s,
+	// so the job only reaches failed once all automatic attempts
+	// are exhausted; the manual Retry below then succeeds.
 	var attempts int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := atomic.AddInt64(&attempts, 1)
-		if n == 1 {
+		if n <= int64(cfg.MaxRetries) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -1735,4 +1739,138 @@ func TestCancelResolveConflictRace(t *testing.T) {
 		}
 		_ = svc.Shutdown(context.Background())
 	}
+}
+
+// --- Test (A5, Phase 6): per-host slots ----------------------------------
+
+// hostBlockingStub blocks every Download until release is closed and
+// records, per hostname, how many downloads ran concurrently.
+type hostBlockingStub struct {
+	release chan struct{}
+	started chan string // receives the hostname of each started download
+
+	mu   sync.Mutex
+	cur  map[string]int
+	peak map[string]int
+}
+
+func (s *hostBlockingStub) Download(ctx context.Context, req domain.TransferRequest) (domain.TransferResult, error) {
+	host := ""
+	if u, err := url.Parse(req.URL); err == nil {
+		host = strings.ToLower(u.Hostname())
+	}
+	s.mu.Lock()
+	s.cur[host]++
+	if s.cur[host] > s.peak[host] {
+		s.peak[host] = s.cur[host]
+	}
+	s.mu.Unlock()
+	s.started <- host
+	<-s.release
+	s.mu.Lock()
+	s.cur[host]--
+	s.mu.Unlock()
+	return domain.TransferResult{Filename: "f.bin"}, nil
+}
+
+func (s *hostBlockingStub) peakFor(host string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.peak[host]
+}
+
+// TestPerHostSlotLimit (A5, Phase 6): with MaxActiveDownloads large,
+// jobs for the same host must not exceed MaxConnectionsPerHost running
+// at once, extra same-host jobs stay queued, and jobs for another host
+// are not blocked by the first host's cap.
+func TestPerHostSlotLimit(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxActiveDownloads = 32
+	cfg.MaxConnectionsPerHost = 2
+
+	stub := &hostBlockingStub{
+		release: make(chan struct{}),
+		started: make(chan string, 32),
+		cur:     make(map[string]int),
+		peak:    make(map[string]int),
+	}
+	svc := NewService(cfg, stub)
+	dir := t.TempDir()
+
+	const hostA = "host-a.example"
+	const hostB = "host-b.example"
+	idsA := make([]string, 0, 5)
+	for i := 0; i < 5; i++ {
+		id, err := svc.AddDownload(AddRequest{
+			URL:            "http://" + hostA + fmt.Sprintf("/f%d.bin", i),
+			DestinationDir: dir,
+			Resolution:     domain.ResolutionAutoRename,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		idsA = append(idsA, id)
+	}
+	idsB := make([]string, 0, 2)
+	for i := 0; i < 2; i++ {
+		id, err := svc.AddDownload(AddRequest{
+			URL:            "http://" + hostB + fmt.Sprintf("/g%d.bin", i),
+			DestinationDir: dir,
+			Resolution:     domain.ResolutionAutoRename,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		idsB = append(idsB, id)
+	}
+
+	// 2 host-A + 2 host-B downloads must start; the rest stay queued.
+	timeout := time.After(5 * time.Second)
+	seen := map[string]int{}
+	for total := 0; total < 4; total++ {
+		select {
+		case h := <-stub.started:
+			seen[h]++
+		case <-timeout:
+			t.Fatalf("expected 4 downloads to start, got %d (%v)", total, seen)
+		}
+	}
+	if seen[hostA] != 2 || seen[hostB] != 2 {
+		t.Fatalf("started per host = %v, want {host-a: 2, host-b: 2}", seen)
+	}
+	// No further job may start while the 4 are blocked.
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case h := <-stub.started:
+		t.Fatalf("extra download started for host %q beyond per-host cap", h)
+	default:
+	}
+	if p := stub.peakFor(hostA); p != 2 {
+		t.Fatalf("peak concurrency for %s = %d, want 2", hostA, p)
+	}
+	// The 3 extra host-A jobs are still queued, not failed/cancelled.
+	for _, id := range idsA[2:] {
+		if st := getJob(svc, id).Status; st != domain.StatusQueued {
+			t.Fatalf("extra host-A job %s status = %q, want queued", id, st)
+		}
+	}
+	// Release everything; all 7 must complete, and the per-host peak
+	// must never have exceeded the cap.
+	close(stub.release)
+	allIDs := append(append([]string{}, idsA...), idsB...)
+	waitFor(t, func() bool {
+		for _, id := range allIDs {
+			if getJob(svc, id).Status != domain.StatusCompleted {
+				return false
+			}
+		}
+		return true
+	}, "all downloads completed")
+	if p := stub.peakFor(hostA); p > 2 {
+		t.Fatalf("peak concurrency for %s exceeded cap: %d", hostA, p)
+	}
+	if p := stub.peakFor(hostB); p > 2 {
+		t.Fatalf("peak concurrency for %s exceeded cap: %d", hostB, p)
+	}
+	_ = svc.Shutdown(context.Background())
 }

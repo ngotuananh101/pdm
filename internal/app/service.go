@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -72,6 +73,8 @@ type Service struct {
 	listener   func()
 	closed     bool
 	running    int
+	// hostRunning counts running jobs per host (A5, Phase 6).
+	hostRunning map[string]int
 }
 
 // NewService creates a Service with the given config and downloader.
@@ -93,9 +96,10 @@ func NewService(cfg config.Config, downloader domain.StreamDownloader) *Service 
 		downloader = engine.NewSingleDownloader(cfg, nil)
 	}
 	return &Service{
-		cfg:        cfg,
-		downloader: downloader,
-		jobs:       make(map[string]*job),
+		cfg:         cfg,
+		downloader:  downloader,
+		jobs:        make(map[string]*job),
+		hostRunning: make(map[string]int),
 	}
 }
 
@@ -735,20 +739,54 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 	}
 }
 
+// hostOf returns the lowercased hostname of rawURL with any port
+// stripped, or "" when the URL cannot be parsed. Jobs with no host
+// are not counted against any per-host limit.
+func hostOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
+}
+
+// maxConnsPerHostLocked returns the effective per-host slot limit:
+// the configured value, or the default when unset.
+func (s *Service) maxConnsPerHostLocked() int {
+	if s.cfg.MaxConnectionsPerHost <= 0 {
+		return config.DefaultMaxConnectionsPerHost
+	}
+	return s.cfg.MaxConnectionsPerHost
+}
+
 // tryDispatchLocked starts queued jobs while slots are available.
 // Caller must hold s.mu.
+//
+// A job is dispatched only when both a global slot
+// (MaxActiveDownloads) and a per-host slot (MaxConnectionsPerHost,
+// A5) are free. The scan skips queued jobs whose host is full and
+// dispatches a later job for another host instead of head-of-line
+// blocking behind a capped host; a job whose host is full simply
+// stays queued until a slot for that host frees up.
 func (s *Service) tryDispatchLocked() {
 	if s.closed {
 		return
 	}
 	for s.running < s.cfg.MaxActiveDownloads {
 		var next *job
+		var nextHost string
 		for _, id := range s.order {
 			j := s.jobs[id]
-			if j != nil && j.download.Status == domain.StatusQueued && !j.running {
-				next = j
-				break
+			if j == nil || j.download.Status != domain.StatusQueued || j.running {
+				continue
 			}
+			h := hostOf(j.download.URL)
+			if h != "" && s.hostRunning[h] >= s.maxConnsPerHostLocked() {
+				continue
+			}
+			next = j
+			nextHost = h
+			break
 		}
 		if next == nil {
 			return
@@ -766,6 +804,9 @@ func (s *Service) tryDispatchLocked() {
 		next.cancelling = false
 		next.running = true
 		s.running++
+		if nextHost != "" {
+			s.hostRunning[nextHost]++
+		}
 		id := next.download.ID
 		go s.run(id, ctx, done)
 	}
@@ -816,10 +857,19 @@ func (s *Service) onProgress(id string, pu domain.ProgressUpdate) {
 // run executes one job. done is closed (via defer) only after the
 // engine has returned and all file handles are closed.
 func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
+	host := ""
 	defer func() {
 		s.mu.Lock()
 		if s.running > 0 {
 			s.running--
+		}
+		// Release this generation's per-host slot (A5). host is
+		// captured when the run started, so the slot is released
+		// even if the job record was removed meanwhile. A Retry
+		// that started a new generation counts its own slot
+		// separately, so one decrement per run is exact.
+		if host != "" && s.hostRunning[host] > 0 {
+			s.hostRunning[host]--
 		}
 		if jj, ok := s.jobs[id]; ok && jj.done == done {
 			jj.running = false
@@ -836,6 +886,7 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 		s.mu.Unlock()
 		return
 	}
+	host = hostOf(j.download.URL)
 	if j.cancelling {
 		if err := s.setStatusLocked(j, domain.StatusCancelled); err != nil {
 			// Unreachable: probing -> cancelled is always allowed

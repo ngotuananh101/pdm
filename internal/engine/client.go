@@ -19,6 +19,11 @@ type CodedError struct {
 	Code    string
 	Message string
 	Cause   error
+
+	// RetryAfter is the minimum wait before retrying, parsed from a
+	// Retry-After header (seconds or HTTP date). Zero when the error
+	// carries no such instruction.
+	RetryAfter time.Duration
 }
 
 // Error returns the sanitized message. It always routes through

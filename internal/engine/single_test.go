@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -759,5 +760,212 @@ func TestDownload_RefusesSymlinkTempFile(t *testing.T) {
 	data, _ := os.ReadFile(real)
 	if string(data) != "orig" {
 		t.Fatalf("symlink target modified: %q", data)
+	}
+}
+
+// --- Test 10 (A4, Phase 6): bounded retry -------------------------------
+
+// TestDownload_Retry503WithRetryAfter: 503 + Retry-After: 1 twice, then
+// 200. The engine must try exactly 3 times, succeed, and wait at
+// least the Retry-After delay before each retry (observed via the
+// injected sleep, so the test itself does not wait in real time).
+func TestDownload_Retry503WithRetryAfter(t *testing.T) {
+	var attempts int64
+	var sleeps []time.Duration
+	body := []byte("ok after retries")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt64(&attempts, 1)
+		if n <= 2 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	dest := t.TempDir()
+	cfg := testConfig()
+	cfg.MaxRetries = 3
+	dl := NewSingleDownloader(cfg, NewHTTPClient(cfg))
+	dl.sleep = func(d time.Duration) { sleeps = append(sleeps, d) }
+	res, err := dl.Download(context.Background(), domain.TransferRequest{
+		ID: "r1", URL: srv.URL + "/file.bin", DestinationDir: dest, Mode: domain.FinalizeOverwrite,
+	})
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+	if len(sleeps) != 2 {
+		t.Fatalf("sleeps = %d, want 2 (one before each retry)", len(sleeps))
+	}
+	for i, s := range sleeps {
+		if s < 1*time.Second {
+			t.Fatalf("sleep[%d] = %v, want >= Retry-After 1s", i, s)
+		}
+	}
+	data, err := os.ReadFile(res.FinalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(body) {
+		t.Fatalf("body = %q, want %q", data, body)
+	}
+}
+
+// TestDownload_RetryStopsAfterMaxRetries: a server that always answers
+// 500 must be tried at most MaxRetries times in total, then fail with
+// the server error code.
+func TestDownload_RetryStopsAfterMaxRetries(t *testing.T) {
+	var attempts int64
+	var sleeps []time.Duration
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&attempts, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	dest := t.TempDir()
+	cfg := testConfig()
+	cfg.MaxRetries = 3
+	dl := NewSingleDownloader(cfg, NewHTTPClient(cfg))
+	dl.sleep = func(d time.Duration) { sleeps = append(sleeps, d) }
+	_, err := dl.Download(context.Background(), domain.TransferRequest{
+		ID: "r2", URL: srv.URL + "/file.bin", DestinationDir: dest, Mode: domain.FinalizeOverwrite,
+	})
+	if err == nil {
+		t.Fatal("expected error for permanent 500, got nil")
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3 (MaxRetries)", attempts)
+	}
+	if len(sleeps) != 2 {
+		t.Fatalf("sleeps = %d, want 2", len(sleeps))
+	}
+	var ce *CodedError
+	if !errors.As(err, &ce) {
+		t.Fatalf("expected CodedError, got %T: %v", err, err)
+	}
+	if ce.Code != string(domain.ErrorCodeHTTPServer) {
+		t.Fatalf("error code = %s, want http_server", ce.Code)
+	}
+}
+
+// TestDownload_Retry429ThenSuccess: 429 is retryable like 503.
+func TestDownload_Retry429ThenSuccess(t *testing.T) {
+	var attempts int64
+	body := []byte("after 429")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt64(&attempts, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	dest := t.TempDir()
+	cfg := testConfig()
+	dl := NewSingleDownloader(cfg, NewHTTPClient(cfg))
+	dl.sleep = func(time.Duration) {}
+	res, err := dl.Download(context.Background(), domain.TransferRequest{
+		ID: "r3", URL: srv.URL + "/file.bin", DestinationDir: dest, Mode: domain.FinalizeOverwrite,
+	})
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	data, _ := os.ReadFile(res.FinalPath)
+	if string(data) != string(body) {
+		t.Fatalf("body = %q, want %q", data, body)
+	}
+}
+
+// TestDownload_NoRetryOnTerminalStatus: 404 and 401 must fail on the
+// first attempt without any retry.
+func TestDownload_NoRetryOnTerminalStatus(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusUnauthorized} {
+		t.Run(fmt.Sprintf("status %d", status), func(t *testing.T) {
+			var attempts int64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt64(&attempts, 1)
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+
+			dest := t.TempDir()
+			cfg := testConfig()
+			dl := NewSingleDownloader(cfg, NewHTTPClient(cfg))
+			dl.sleep = func(time.Duration) { t.Fatal("sleep must not be called for terminal errors") }
+			_, err := dl.Download(context.Background(), domain.TransferRequest{
+				ID: "r4", URL: srv.URL + "/file.bin", DestinationDir: dest, Mode: domain.FinalizeOverwrite,
+			})
+			if err == nil {
+				t.Fatalf("expected error for status %d, got nil", status)
+			}
+			if attempts != 1 {
+				t.Fatalf("attempts = %d, want 1 (no retry for %d)", attempts, status)
+			}
+		})
+	}
+}
+
+// TestDownload_RetryNetworkError: a transport failure is transient and
+// retried; after MaxRetries attempts the network error is reported.
+func TestDownload_RetryNetworkError(t *testing.T) {
+	var attempts int64
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		atomic.AddInt64(&attempts, 1)
+		return nil, errors.New("connection refused")
+	})
+	dest := t.TempDir()
+	cfg := testConfig()
+	cfg.MaxRetries = 3
+	dl := NewSingleDownloader(cfg, &http.Client{Transport: transport})
+	dl.sleep = func(time.Duration) {}
+	_, err := dl.Download(context.Background(), domain.TransferRequest{
+		ID: "r5", URL: "http://example.com/file.bin", DestinationDir: dest, Mode: domain.FinalizeOverwrite,
+	})
+	if err == nil {
+		t.Fatal("expected network error, got nil")
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+	var ce *CodedError
+	if !errors.As(err, &ce) || ce.Code != string(domain.ErrorCodeNetwork) {
+		t.Fatalf("error = %v, want network_error CodedError", err)
+	}
+}
+
+// TestParseRetryAfter covers the seconds and HTTP-date forms, plus
+// invalid and past values.
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	future := now.Add(30 * time.Second).UTC().Format(http.TimeFormat)
+	past := now.Add(-time.Minute).UTC().Format(http.TimeFormat)
+	cases := []struct {
+		value string
+		want  time.Duration
+	}{
+		{"", 0},
+		{"1", 1 * time.Second},
+		{"120", 120 * time.Second},
+		{"  5  ", 5 * time.Second},
+		{"-1", 0},
+		{"soon", 0},
+		{future, 30 * time.Second},
+		{past, 0},
+	}
+	for _, tc := range cases {
+		if got := parseRetryAfter(tc.value, now); got != tc.want {
+			t.Fatalf("parseRetryAfter(%q) = %v, want %v", tc.value, got, tc.want)
+		}
 	}
 }
