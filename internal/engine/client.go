@@ -76,7 +76,12 @@ func NewHTTPClient(cfg config.Config) *http.Client {
 			if len(via) >= 10 {
 				return codeError(domain.ErrorCodeNetwork, "too many redirects", nil)
 			}
-			if _, err := platform.ValidateHTTPURL(req.URL.String()); err != nil {
+			// Redirect targets must be public: a public origin
+			// redirecting to loopback/private/link-local would be an
+			// SSRF vector (P1). ValidatePublicHTTPURL also re-checks
+			// scheme/credentials, so it subsumes the ValidateHTTPURL
+			// call it replaces.
+			if _, err := platform.ValidatePublicHTTPURL(req.URL.String()); err != nil {
 				return err
 			}
 			// Preserve Accept-Encoding: identity across redirects.

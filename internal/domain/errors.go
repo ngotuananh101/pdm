@@ -32,6 +32,7 @@ var (
 	ErrInvalidURL         = errors.New("invalid URL")
 	ErrUnsupportedScheme  = errors.New("unsupported URL scheme")
 	ErrURLHasCredentials  = errors.New("URL must not contain credentials")
+	ErrNonPublicURL       = errors.New("URL resolves to a non-public address")
 	ErrInvalidFilename    = errors.New("invalid filename")
 	ErrInvalidDestination = errors.New("invalid destination")
 	ErrDestinationExists  = errors.New("destination already exists")

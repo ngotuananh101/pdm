@@ -171,21 +171,40 @@ func TestDownload_ContentDisposition_Traversal(t *testing.T) {
 // --- Test 4: Valid redirect vs malicious redirect ------------------------
 func TestDownload_Redirect(t *testing.T) {
 	t.Run("valid redirect", func(t *testing.T) {
+		// P1 (Phase 5): the engine's CheckRedirect now refuses
+		// loopback/private redirect targets, so a redirect within an
+		// httptest server (127.0.0.1) is no longer a "valid" redirect.
+		// Redirect-following is instead verified with a stub
+		// transport: the origin returns 302 to a public IP literal,
+		// which passes the SSRF check, and the stub serves the body.
+		// No real network is involved.
 		body := []byte("redirected ok")
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			if r.URL.Path == "/old" {
-				http.Redirect(w, r, "/new/file.txt", http.StatusFound)
-				return
+				return &http.Response{
+					StatusCode:    http.StatusFound,
+					Header:        http.Header{"Location": []string{"http://93.184.216.34/new/file.txt"}},
+					Body:          io.NopCloser(strings.NewReader("")),
+					ContentLength: 0,
+					Request:       r,
+				}, nil
 			}
-			_, _ = w.Write(body)
-		}))
-		defer srv.Close()
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        make(http.Header),
+				Body:          io.NopCloser(strings.NewReader(string(body))),
+				ContentLength: int64(len(body)),
+				Request:       r,
+			}, nil
+		})
 
 		dest := t.TempDir()
 		cfg := testConfig()
-		dl := NewSingleDownloader(cfg, NewHTTPClient(cfg))
+		client := NewHTTPClient(cfg)
+		client.Transport = transport
+		dl := NewSingleDownloader(cfg, client)
 		res, err := dl.Download(context.Background(), domain.TransferRequest{
-			ID: "t4a", URL: srv.URL + "/old", DestinationDir: dest, Mode: domain.FinalizeOverwrite,
+			ID: "t4a", URL: "http://example.com/old", DestinationDir: dest, Mode: domain.FinalizeOverwrite,
 		})
 		if err != nil {
 			t.Fatalf("Download after redirect: %v", err)

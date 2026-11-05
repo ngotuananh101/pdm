@@ -280,12 +280,13 @@ PDM desktop process → validate → hộp thoại xác nhận → hàng đợi
 - Native host là **tiến trình riêng**, không phải chính tiến trình UI. Chrome yêu cầu host manifest, `allowed_origins`, đăng ký theo OS, framing length-prefix và stdout chỉ dành cho protocol; log đưa sang stderr. Cần giới hạn kích thước message. [Chrome — Native messaging](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging).
 - Extension gửi URL theo thao tác người dùng trước; không tự thu thập cookie/headers. Kiểm soát scope quyền extension tối thiểu. Firefox cần manifest/đăng ký riêng; không giả định giống Chrome.
 - Nếu PDM đang chạy, native host chuyển yêu cầu qua IPC OS-local có cơ chế giới hạn quyền, xác thực peer hoặc token bảo vệ và giới hạn message. Nếu chưa chạy, thiết kế launch/handshake an toàn; không đưa URL/token nhạy cảm vào command line hoặc log.
-- Từ chối scheme ngoài HTTP/HTTPS; xác nhận URL/tên đích trước khi tải, không cho extension tùy ý ghi đè path, cấu hình hoặc thực thi lệnh. Cân nhắc bảo vệ địa chỉ local/private và DNS rebinding nếu nhận URL từ nguồn không tin cậy; cho phép mạng nội bộ chỉ qua quyết định rõ ràng của người dùng.
+- Từ chối scheme ngoài HTTP/HTTPS; xác nhận URL/tên đích trước khi tải, không cho extension tùy ý ghi đè path, cấu hình hoặc thực thi lệnh. Cân nhắc bảo vệ địa chỉ local/private và DNS rebinding nếu nhận URL từ nguồn không tin cậy; cho phép mạng nội bộ chỉ qua quyết định rõ ràng của người dùng. Ở MVP, quy tắc public-only đã được enforce tại UI và redirect (xem §12); browser integration sau này dùng chung quy tắc này, không tự đặt lại.
 - Việc bắt/take over mọi lượt tải của browser có các giới hạn API, tải trùng và quyền riêng tư; xác minh từng trình duyệt trước khi cam kết tính năng.
 
 ## 12. Bảo mật
 
 - Validate URL, redirects và tên file; xử lý `Content-Disposition` như dữ liệu không tin cậy. Loại path traversal, ký tự cấm, tên thiết bị Windows và đường dẫn tuyệt đối; giới hạn độ dài.
+- SSRF (P1, đã triển khai): `platform.ValidatePublicHTTPURL` chỉ chấp nhận URL có host public — từ chối IP literal loopback/private/link-local/unspecified và hostname resolve ra các dải đó (hostname không resolve được cũng bị từ chối). Kiểm tra áp dụng tại UI (`add_dialog.validateURL`) và tại `CheckRedirect` của engine client. Giới hạn đã biết: (1) gọi trực tiếp `engine.Download` với URL loopback không bị chặn — engine là layer nội bộ, production chỉ service gọi nó và mọi lượt tải thật đều qua UI + redirect; (2) DNS rebinding — IP có thể đổi sau lúc resolve, chưa pin IP ở tầng dial.
 - Chống ghi đè ngoài ý muốn, kể cả symlink/race; dùng primitive OS phù hợp và kiểm thử. Không chạy file tải về tự động.
 - TLS bật kiểm tra chứng chỉ mặc định; không thêm tùy chọn bỏ qua TLS verification cho MVP.
 - Che query string, userinfo, headers nhạy cảm trong logs, thông báo lỗi và màn hình mặc định. Không hardcode token.

@@ -209,11 +209,13 @@ func (ad *addDialog) showError(msg string) {
 }
 
 // validateURL checks that url is an absolute http/https URL free of
-// credentials, control characters, and malformed hosts. It delegates to
-// platform.ValidateHTTPURL so the UI enforces exactly the same policy as
-// the engine.
+// credentials, control characters, and malformed hosts, and that its
+// host is public (P1 SSRF guard). It delegates to
+// platform.ValidatePublicHTTPURL, which includes the
+// platform.ValidateHTTPURL syntax checks, so the UI enforces exactly
+// the same policy as the engine's redirect check.
 func validateURL(url string) error {
-	_, err := platform.ValidateHTTPURL(url)
+	_, err := platform.ValidatePublicHTTPURL(url)
 	return err
 }
 

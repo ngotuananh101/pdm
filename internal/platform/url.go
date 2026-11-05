@@ -3,6 +3,7 @@ package platform
 import (
 	"fmt"
 	"mime"
+	"net"
 	"net/url"
 	"path"
 	"strings"
@@ -44,6 +45,52 @@ func ValidateHTTPURL(raw string) (*url.URL, error) {
 	// Normalize scheme to lowercase for downstream comparisons.
 	u.Scheme = scheme
 	return u, nil
+}
+
+// ValidatePublicHTTPURL is ValidateHTTPURL plus an SSRF guard: the host
+// must be public. IP literals in loopback, private, link-local or
+// unspecified ranges are rejected, and hostnames are resolved with
+// net.LookupIP and rejected if any address falls in those ranges. A
+// hostname that cannot be resolved is rejected as well (fail closed):
+// an unverifiable host must not be fetched.
+//
+// ValidateHTTPURL itself deliberately keeps accepting loopback and
+// private hosts: it only checks syntax/scheme/credentials, so the
+// engine and its httptest-based tests can keep using local servers.
+// Only the trust boundaries — the UI add dialog and the engine's
+// redirect check — call ValidatePublicHTTPURL.
+func ValidatePublicHTTPURL(raw string) (*url.URL, error) {
+	u, err := ValidateHTTPURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	host := u.Hostname()
+	if ip := net.ParseIP(host); ip != nil {
+		if isNonPublicIP(ip) {
+			return nil, fmt.Errorf("%w: %s", domain.ErrNonPublicURL, host)
+		}
+		return u, nil
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, fmt.Errorf("%w: cannot resolve host %s: %v", domain.ErrNonPublicURL, host, err)
+	}
+	for _, ip := range ips {
+		if isNonPublicIP(ip) {
+			return nil, fmt.Errorf("%w: %s resolves to %s", domain.ErrNonPublicURL, host, ip.String())
+		}
+	}
+	return u, nil
+}
+
+// isNonPublicIP reports whether ip is loopback, private, link-local or
+// unspecified. IPv4-mapped IPv6 addresses are normalized first so
+// ::ffff:127.0.0.1 is treated like 127.0.0.1.
+func isNonPublicIP(ip net.IP) bool {
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()
 }
 
 // DeriveFilenameFromURL returns a sanitized filename derived from the
