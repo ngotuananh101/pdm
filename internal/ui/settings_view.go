@@ -24,10 +24,24 @@ func conflictPolicyLabel(p ConflictPolicy) string {
 	}
 }
 
+// segmentsLabel is the settings form label for the max-segments field
+// (Stage 3, Phase 5.2: user-configurable, default 4, range 1..16).
+const segmentsLabel = "Số đoạn tối đa mỗi lượt tải (1..16)"
+
 // settingsDialog builds the Settings dialog (ARCHITECTURE section 10).
+// The widgets are built by build() and kept as fields so tests can drive
+// the dialog (prefill, save, error display) without opening a window.
 type settingsDialog struct {
 	parent fyne.Window
 	svc    DownloadService
+
+	dirEntry      *widget.Entry
+	policySelect  *widget.Select
+	maxEntry      *widget.Entry
+	segmentsEntry *widget.Entry
+	errLabel      *widget.Label
+	form          *widget.Form
+	dlg           dialog.Dialog
 }
 
 // newSettingsDialog creates the dialog.
@@ -35,77 +49,99 @@ func newSettingsDialog(parent fyne.Window, svc DownloadService) *settingsDialog 
 	return &settingsDialog{parent: parent, svc: svc}
 }
 
-// show opens the modal with current values.
-func (s *settingsDialog) show() {
+// build constructs the form widgets from the current config.
+func (s *settingsDialog) build() {
 	cfg := s.svc.GetConfig()
 
-	dirEntry := widget.NewEntry()
-	dirEntry.SetText(cfg.DefaultDownloadDir)
+	s.dirEntry = widget.NewEntry()
+	s.dirEntry.SetText(cfg.DefaultDownloadDir)
 	browse := widget.NewButton("Browse...", func() {
 		dialog.ShowFolderOpen(func(folder fyne.ListableURI, err error) {
 			if err != nil || folder == nil {
 				return
 			}
-			dirEntry.SetText(folder.Path())
+			s.dirEntry.SetText(folder.Path())
 		}, s.parent)
 	})
 
-	policySelect := widget.NewSelect([]string{
+	s.policySelect = widget.NewSelect([]string{
 		"Ask every time (Default)",
 		"Auto-rename (e.g. file (1).ext)",
 		"Overwrite existing file",
 	}, func(string) {})
-	policySelect.SetSelected(conflictPolicyLabel(cfg.ConflictPolicy))
+	s.policySelect.SetSelected(conflictPolicyLabel(cfg.ConflictPolicy))
 
-	maxEntry := widget.NewEntry()
-	maxEntry.SetText(strconv.Itoa(cfg.MaxActiveDownloads))
+	s.maxEntry = widget.NewEntry()
+	s.maxEntry.SetText(strconv.Itoa(cfg.MaxActiveDownloads))
 
-	errLabel := widget.NewLabel("")
-	errLabel.Wrapping = fyne.TextWrapWord
-	errLabel.Hide()
+	s.segmentsEntry = widget.NewEntry()
+	s.segmentsEntry.SetText(strconv.Itoa(cfg.SegmentsPerDownload))
 
-	form := widget.NewForm(
-		widget.NewFormItem("Default download directory", container.NewBorder(nil, nil, nil, browse, dirEntry)),
-		widget.NewFormItem("Duplicate file policy", policySelect),
-		widget.NewFormItem("Max active downloads (1..32)", maxEntry),
+	s.errLabel = widget.NewLabel("")
+	s.errLabel.Wrapping = fyne.TextWrapWord
+	s.errLabel.Hide()
+
+	s.form = widget.NewForm(
+		widget.NewFormItem("Default download directory", container.NewBorder(nil, nil, nil, browse, s.dirEntry)),
+		widget.NewFormItem("Duplicate file policy", s.policySelect),
+		widget.NewFormItem("Max active downloads (1..32)", s.maxEntry),
+		widget.NewFormItem(segmentsLabel, s.segmentsEntry),
 	)
-	content := container.NewVBox(form, errLabel)
+}
 
-	var d dialog.Dialog
+// save validates the entries and persists them via svc.SaveConfig. It
+// returns false — leaving the error visible and the dialog open — when a
+// value is invalid or the save fails, true when the settings were saved.
+func (s *settingsDialog) save() bool {
+	max, err := strconv.Atoi(strings.TrimSpace(s.maxEntry.Text))
+	if err != nil || max < 1 || max > 32 {
+		s.errLabel.SetText(domain.SanitizeErrorText("Max active downloads must be a number between 1 and 32."))
+		s.errLabel.Show()
+		return false
+	}
+	segments, err := strconv.Atoi(strings.TrimSpace(s.segmentsEntry.Text))
+	if err != nil || segments < 1 || segments > 16 {
+		s.errLabel.SetText(domain.SanitizeErrorText("Segments per download must be a number between 1 and 16."))
+		s.errLabel.Show()
+		return false
+	}
+	if strings.TrimSpace(s.dirEntry.Text) == "" {
+		s.errLabel.SetText(domain.SanitizeErrorText("Default download directory is required."))
+		s.errLabel.Show()
+		return false
+	}
+	if err := s.svc.SaveConfig(ScratchConfig{
+		DefaultDownloadDir:  strings.TrimSpace(s.dirEntry.Text),
+		ConflictPolicy:      policyFromLabel(s.policySelect.Selected),
+		MaxActiveDownloads:  max,
+		SegmentsPerDownload: segments,
+	}); err != nil {
+		s.errLabel.SetText(domain.SanitizeErrorText(err.Error()))
+		s.errLabel.Show()
+		return false
+	}
+	s.errLabel.Hide()
+	return true
+}
+
+// show opens the modal with current values.
+func (s *settingsDialog) show() {
+	s.build()
+	content := container.NewVBox(s.form, s.errLabel)
+
 	saveBtn := widget.NewButton("Save", func() {
-		max, err := strconv.Atoi(strings.TrimSpace(maxEntry.Text))
-		if err != nil || max < 1 || max > 32 {
-			errLabel.SetText(domain.SanitizeErrorText("Max active downloads must be a number between 1 and 32."))
-			errLabel.Show()
-			return
-		}
-		if strings.TrimSpace(dirEntry.Text) == "" {
-			errLabel.SetText(domain.SanitizeErrorText("Default download directory is required."))
-			errLabel.Show()
-			return
-		}
-		if err := s.svc.SaveConfig(ScratchConfig{
-			DefaultDownloadDir: strings.TrimSpace(dirEntry.Text),
-			ConflictPolicy:     policyFromLabel(policySelect.Selected),
-			MaxActiveDownloads: max,
-		}); err != nil {
-			errLabel.SetText(domain.SanitizeErrorText(err.Error()))
-			errLabel.Show()
-			return
-		}
-		errLabel.Hide()
-		if d != nil {
-			d.Hide()
+		if s.save() && s.dlg != nil {
+			s.dlg.Hide()
 		}
 	})
-	d = dialog.NewCustom("Settings", "Dismiss", content, s.parent)
-	if cd, ok := d.(*dialog.CustomDialog); ok {
+	s.dlg = dialog.NewCustom("Settings", "Dismiss", content, s.parent)
+	if cd, ok := s.dlg.(*dialog.CustomDialog); ok {
 		cd.SetButtons([]fyne.CanvasObject{saveBtn, widget.NewButton("Cancel", func() {
-			d.Hide()
+			s.dlg.Hide()
 		})})
 	}
-	d.Resize(fyne.NewSize(560, 340))
-	d.Show()
+	s.dlg.Resize(fyne.NewSize(560, 340))
+	s.dlg.Show()
 }
 
 func policyFromLabel(label string) ConflictPolicy {

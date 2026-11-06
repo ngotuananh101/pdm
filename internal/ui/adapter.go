@@ -199,9 +199,10 @@ func (a *AppServiceAdapter) List() []DownloadSnapshot {
 func (a *AppServiceAdapter) GetConfig() Config {
 	cfg := a.svc.GetConfig()
 	return Config{
-		DefaultDownloadDir: cfg.DefaultDownloadDir,
-		ConflictPolicy:     mapPolicy(cfg.FileConflictPolicy),
-		MaxActiveDownloads: cfg.MaxActiveDownloads,
+		DefaultDownloadDir:  cfg.DefaultDownloadDir,
+		ConflictPolicy:      mapPolicy(cfg.FileConflictPolicy),
+		MaxActiveDownloads:  cfg.MaxActiveDownloads,
+		SegmentsPerDownload: cfg.SegmentsPerDownload,
 	}
 }
 
@@ -210,10 +211,11 @@ func (a *AppServiceAdapter) SaveConfig(sc ScratchConfig) error {
 	cur.DefaultDownloadDir = sc.DefaultDownloadDir
 	cur.FileConflictPolicy = mapPolicyReverse(sc.ConflictPolicy)
 	cur.MaxActiveDownloads = sc.MaxActiveDownloads
+	cur.SegmentsPerDownload = sc.SegmentsPerDownload
 	if err := a.svc.UpdateConfig(cur); err != nil {
 		return err
 	}
-	// Persist the full current config (not just the three edited
+	// Persist the full current config (not just the four edited
 	// fields) so SaveConfig never clobbers settings the UI does
 	// not own. The in-memory config is already updated above; a
 	// disk failure is reported instead of silently pretending the

@@ -2,7 +2,7 @@
 // SQLite in Stage 2, Phase 3).
 //
 // SaveConfig must write the full current config through the injected
-// settings store — editing only the three UI-owned fields — so
+// settings store — editing only the four UI-owned fields — so
 // settings the UI does not own survive a save, and a later GetSettings
 // returns exactly what was saved.
 package ui
@@ -55,9 +55,10 @@ func TestAdapterSaveConfigPersistsAndPreservesOtherFields(t *testing.T) {
 	ad.SetSettingsStore(store)
 
 	if err := ad.SaveConfig(ScratchConfig{
-		DefaultDownloadDir: "/tmp/elsewhere",
-		ConflictPolicy:     ConflictAutoRename,
-		MaxActiveDownloads: 7,
+		DefaultDownloadDir:  "/tmp/elsewhere",
+		ConflictPolicy:      ConflictAutoRename,
+		MaxActiveDownloads:  7,
+		SegmentsPerDownload: 8,
 	}); err != nil {
 		t.Fatalf("SaveConfig = %v", err)
 	}
@@ -88,9 +89,10 @@ func TestAdapterSaveConfigInvalidReturnsError(t *testing.T) {
 	ad.SetSettingsStore(store)
 
 	if err := ad.SaveConfig(ScratchConfig{
-		DefaultDownloadDir: "/tmp/elsewhere",
-		ConflictPolicy:     ConflictAsk,
-		MaxActiveDownloads: 0, // outside Validate bounds.
+		DefaultDownloadDir:  "/tmp/elsewhere",
+		ConflictPolicy:      ConflictAsk,
+		MaxActiveDownloads:  0, // outside Validate bounds.
+		SegmentsPerDownload: 4,
 	}); err == nil {
 		t.Fatal("SaveConfig with MaxActiveDownloads 0 should return an error")
 	}
@@ -107,9 +109,10 @@ func TestAdapterSaveConfigWithoutStoreReturnsError(t *testing.T) {
 	// No SetSettingsStore call: SaveConfig must fail loudly instead
 	// of silently writing settings the next startup would ignore.
 	if err := ad.SaveConfig(ScratchConfig{
-		DefaultDownloadDir: "/tmp/elsewhere",
-		ConflictPolicy:     ConflictAsk,
-		MaxActiveDownloads: 3,
+		DefaultDownloadDir:  "/tmp/elsewhere",
+		ConflictPolicy:      ConflictAsk,
+		MaxActiveDownloads:  3,
+		SegmentsPerDownload: 4,
 	}); err == nil {
 		t.Fatal("SaveConfig without a settings store should return an error")
 	}

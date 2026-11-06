@@ -67,7 +67,14 @@ func updateRowContents(obj fyne.CanvasObject, r RowViewModel, onCancel, onResolv
 	var filename, status *widget.Label
 	if topBox != nil && len(topBox.Objects) >= 2 {
 		filename, _ = topBox.Objects[1].(*widget.Label)
-		status, _ = topBox.Objects[0].(*widget.Label)
+		// The status label is not a direct child of the top box:
+		// newRowTemplate wraps it in a VBox (the left element of
+		// the border). Reading it directly used to yield nil and
+		// abort the whole row update, so no action button ever
+		// rendered. (Stage 3, Phase 5.3.)
+		if statusBox, ok := topBox.Objects[0].(*fyne.Container); ok && len(statusBox.Objects) >= 1 {
+			status, _ = statusBox.Objects[0].(*widget.Label)
+		}
 	}
 	progress, _ := body.Objects[1].(*widget.ProgressBar)
 	stats, _ := body.Objects[2].(*widget.Label)
@@ -107,9 +114,10 @@ func updateRowContents(obj fyne.CanvasObject, r RowViewModel, onCancel, onResolv
 		actions.Add(pause)
 		actions.Add(btn)
 	case r.Status == StatusPaused:
-		// The label states the Stage 1 semantics: Resume restarts
-		// the download from the beginning (no Range resume yet).
-		resume := widget.NewButton("Resume (restarts from start)", func() { onResume(id) })
+		// Stage 3: Resume continues from the bytes already
+		// committed when the server supports Range (Phase 4.1);
+		// it no longer restarts the download from the beginning.
+		resume := widget.NewButton("Resume", func() { onResume(id) })
 		btn := widget.NewButton("Cancel", func() { onCancel(id) })
 		actions.Add(resume)
 		actions.Add(btn)

@@ -12,9 +12,10 @@ import (
 // defined here so internal/ui does not depend on config internals, and
 // cmd/pdm adapts the real config into it.
 type Config struct {
-	DefaultDownloadDir string
-	ConflictPolicy     ConflictPolicy
-	MaxActiveDownloads int
+	DefaultDownloadDir  string
+	ConflictPolicy      ConflictPolicy
+	MaxActiveDownloads  int
+	SegmentsPerDownload int
 }
 
 // ConflictPolicy selects how duplicate destination files are handled.
@@ -76,9 +77,10 @@ type DownloadService interface {
 	// keeping the .part file. A queued download is parked without
 	// starting.
 	Pause(id string) error
-	// Resume re-queues a paused download from the beginning:
-	// Stage 1 has no HTTP Range resume, so the next worker
-	// downloads the file again from byte 0.
+	// Resume re-queues a paused download. Since Stage 3 it continues
+	// from the bytes already committed when the server supports Range;
+	// when the server does not support Range the download restarts
+	// from the beginning.
 	Resume(id string) error
 	// Remove deletes the record from the list without touching any file.
 	Remove(id string) error
@@ -112,9 +114,10 @@ type ServiceFactory func() DownloadService
 // ScratchConfig is the settings-update payload used by the settings dialog.
 // Named separately from Config so callers must be explicit.
 type ScratchConfig struct {
-	DefaultDownloadDir string
-	ConflictPolicy     ConflictPolicy
-	MaxActiveDownloads int
+	DefaultDownloadDir  string
+	ConflictPolicy      ConflictPolicy
+	MaxActiveDownloads  int
+	SegmentsPerDownload int
 }
 
 // NoopService is an in-memory test double. It is not a production service;
@@ -132,9 +135,10 @@ type NoopService struct {
 func NewNoopService() *NoopService {
 	return &NoopService{
 		cfg: Config{
-			DefaultDownloadDir: "~/.local/share/pdm/downloads",
-			ConflictPolicy:     ConflictAsk,
-			MaxActiveDownloads: 3,
+			DefaultDownloadDir:  "~/.local/share/pdm/downloads",
+			ConflictPolicy:      ConflictAsk,
+			MaxActiveDownloads:  3,
+			SegmentsPerDownload: 4,
 		},
 	}
 }
