@@ -318,8 +318,9 @@ func TestRecovery_FinalizingPartGoneFinalExistsFailed(t *testing.T) {
 	}
 	// The .part is gone and a file exists at the destination, but
 	// ARCH §5 forbids marking completed merely because a file
-	// exists: Stage 2 has no durable size/validator to verify it
-	// with, so the job must fail and let the user check.
+	// exists: without the .part there is nothing to rename, and
+	// the destination file cannot be verified as this job's
+	// output, so the job must fail and let the user check.
 	if dispatch := seedAndInstall(t, svc, repo, d); dispatch {
 		t.Fatal("finalizing job must not be dispatched")
 	}

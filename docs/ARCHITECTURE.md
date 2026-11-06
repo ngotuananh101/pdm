@@ -180,7 +180,7 @@ paused ──resume──► queued       failed ──retry──► queued
 - Các transition ghi DB nhất quán; service từ chối thao tác không hợp lệ. `completed` là terminal, trừ khi người dùng chủ động xóa bản ghi. Từ Stage 2, mọi chuyển trạng thái đều ghi xuống SQLite trong cùng thao tác; ghi DB lỗi thì giữ trạng thái cũ trong RAM và trả lỗi, không báo thành công giả.
 - `Pause` khi đang tải: phát cancel → chờ worker kết thúc → flush/checkpoint → ghi `paused`. UI có thể biểu diễn `pausing` tạm thời nhưng không được báo paused khi worker vẫn ghi.
 - `Cancel`: dừng worker; mặc định **hỏi người dùng** có xóa file tạm hay không. Xóa bản ghi và xóa file là hai lựa chọn riêng; không tự xóa file hoàn tất.
-- Khi startup (Stage 2, quyết định đã chốt): kiểm tra DB + file `.part`; `probing`/`downloading` từ phiên trước chuyển sang `queued` để tự chạy tiếp (tải lại từ đầu, do Stage 1/2 chưa có resume từ điểm dừng); nếu metadata nói đã tải được byte mà file `.part` đã mất thì đánh `failed`. Job `finalizing` cần reconciliation theo §8: ở Stage 2 luôn đánh `failed` vì metadata bền vững không xác minh được file đích (kích thước/validator chỉ xuống DB ở lúc chuyển trạng thái); không đánh dấu hoàn tất chỉ vì file có tồn tại. Recovery không tự xóa hay ghi đè file nào; `Retry` tải lại từ đầu.
+- Khi startup (Stage 3, quyết định Stage 2 giữ nguyên với resume thật): kiểm tra DB + file `.part`; `probing`/`downloading` từ phiên trước chuyển sang `queued` để tự chạy tiếp — khi chạy lại, job resume thật từ segment plan đã commit nếu server vẫn hỗ trợ Range và validator còn khớp, nếu không thì tải lại từ đầu; nếu metadata nói đã tải được byte mà file `.part` đã mất thì đánh `failed`. Job `finalizing` được reconciliation theo §8: xác minh được (mọi segment đã commit, kích thước `.part` khớp, validator còn khớp) thì finalize tiếp và `completed`, nếu không xác minh được thì đánh `failed`; không đánh dấu hoàn tất chỉ vì file có tồn tại. Recovery không tự xóa hay ghi đè file nào; `Retry` tải lại từ đầu khi không resume được.
 
 ## 6. Quy trình tải
 
@@ -199,10 +199,12 @@ paused ──resume──► queued       failed ──retry──► queued
 - `416`: kiểm tra lại kích thước/validator; không mặc định là đã tải xong. `HEAD`, redirects và tính năng range có thể khác nhau giữa các server.
 - Khi resume, dùng **strong ETag** với `If-Range`; không dùng weak ETag cho `If-Range`. Nếu không có strong ETag, chỉ dùng `Last-Modified` khi đủ điều kiện là strong validator theo HTTP; nếu không xác minh được tính bất biến, mặc định yêu cầu tải lại từ đầu hoặc xác nhận rủi ro — không ghép dữ liệu khác phiên bản.
 - Giữ `Accept-Encoding: identity` và tắt nén tự động ở transport để byte range tương ứng dữ liệu ghi; kiểm tra response không đổi encoding. Lưu validator cuối sau redirect; nếu URL/validator thay đổi, dừng và xác minh lại.
-- Không hứa pause/resume đối với server không hỗ trợ Range. Pause vẫn dừng tác vụ, nhưng resume có thể phải bắt đầu lại; thông báo rõ trên UI.
+- Không hứa pause/resume đối với server không hỗ trợ Range. Pause vẫn dừng tác vụ; resume tiếp tục từ byte đã commit khi server hỗ trợ Range, và tải lại từ đầu khi server không hỗ trợ Range. Nút Resume không còn ghi “tải lại từ đầu”.
 - HTTP 401/403: báo xác thực/quyền truy cập, không retry vô hạn. 404: báo lỗi. 429/503: backoff có jitter và tôn trọng `Retry-After` nếu hợp lệ. Timeout/network/5xx: retry hữu hạn; `context.Canceled` do pause/cancel không tính là lỗi mạng.
 
 Tài liệu tham khảo: [MDN — Range requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Range_requests), [RFC 9110 — If-Range](https://www.rfc-editor.org/rfc/rfc9110.html#name-if-range).
+
+Trạng thái triển khai (Stage 3): probe (`internal/engine/probe.go`, GET `Range: bytes=0-0`, không gửi HEAD), chia segment (`internal/domain/segment.go`, `SplitSegments`), lưu plan segment (`internal/storage/sqlite/segment_repo.go`), worker theo đoạn (`internal/engine/worker.go`) và checkpoint (`internal/engine/checkpoint.go`) đã triển khai; điều phối ở `internal/engine/manager.go`.
 
 ## 7. Scheduler, mạng và tài nguyên
 
@@ -236,12 +238,16 @@ File thưa/preallocate có thể chứa byte chưa tải, vì vậy **kích thư
 3. Trên crash, chỉ tin `committed_bytes`; phần đã ghi sau checkpoint có thể tải lại và ghi đè. Bảo đảm tệp còn đúng kích thước/identity và validator vẫn hợp lệ. Nếu thiếu `.part` hoặc metadata bất nhất, chuyển `failed` và cho phép restart sạch.
 4. Có thể đánh đổi hiệu năng bằng cách checkpoint ít hơn; cần benchmark `fsync` trên Windows/macOS/Linux. Độ bền thực tế phụ thuộc hệ điều hành, filesystem và SQLite; không cam kết chống mất điện tuyệt đối nếu chưa kiểm thử.
 
+Trạng thái triển khai (Stage 3): checkpoint đã triển khai trong `internal/engine/checkpoint.go` — sync file trước, ghi offset đã sync xuống DB sau, chỉ công bố sau khi ghi thành công; khi sync/commit lỗi thì dừng job. Lệch chữ so với thiết kế: mỗi segment ghi bằng một `UpdateCommitted` riêng (mỗi lần ghi là một transaction, chỉ advance, không bao giờ lùi) thay vì một transaction duy nhất cho toàn bộ checkpoint; tính chất an toàn giữ nguyên — crash giữa chừng có thể để một số segment đã publish và số khác chưa, nhưng không segment nào claim byte chưa sync.
+
 ### Hoàn tất an toàn
 
 - Lưu thông tin dự định hoàn tất và kiểm tra mọi segment đã commit trước khi vào `finalizing`.
 - `Sync`, đóng file, xác nhận kích thước; nếu có checksum từ nguồn tin cậy thì kiểm tra. Không coi checksum tự tạo sau khi tải là xác thực nội dung từ server.
 - Rename từ `.part` sang đích cùng filesystem. Mặc định **không ghi đè**: chọn tên mới hoặc yêu cầu xác nhận. Phải dùng cơ chế no-clobber phù hợp OS, không dựa vào `Stat` rồi `Rename` vì có race; nếu không hỗ trợ, báo lỗi an toàn. Không giả định rename đè có cùng semantics trên mọi OS.
 - Chỉ ghi `completed` sau khi rename thành công. Khi restart giữa rename và commit, reconciliation dựa trên đường dẫn, kích thước, validator/checksum và metadata `finalizing`; nếu không thể xác minh thì yêu cầu người dùng kiểm tra, không tự xóa hay ghi đè.
+
+Trạng thái triển khai (Stage 3): finalize đã triển khai trong `internal/engine/finalize.go` (đóng/sync, xác minh kích thước, rename no-clobber, chỉ ghi `completed` sau khi rename thành công; `FinalPath` ghi xuống DB ngay tại transition) và reconciliation `finalizing` ở `internal/app/lifecycle.go` (xác minh được thì finalize tiếp, không xác minh được thì `failed`, không tự xóa hay ghi đè).
 - Dung lượng trống có thể thay đổi; mọi `WriteAt`, `Sync`, `Close`, transaction và rename đều phải kiểm tra lỗi. Không tự xóa file người dùng khi lỗi.
 
 ## 9. SQLite và migration
@@ -259,9 +265,9 @@ File thưa/preallocate có thể chứa byte chưa tải, vì vậy **kích thư
 1. **Danh sách:** tên, trạng thái, tiến độ, tốc độ, ETA; nút thêm/tạm dừng/tiếp tục/xóa.
 2. **Thêm tải:** URL, thư mục, tên file tùy chọn; báo lỗi hợp lệ trước khi tạo.
 3. **Chi tiết:** kích thước, nguồn đã che, đường dẫn, số đoạn, lỗi và tùy chọn retry.
-4. **Cài đặt:** thư mục mặc định, số tải đồng thời, số kết nối, chính sách khi đóng cửa sổ.
+4. **Cài đặt:** thư mục mặc định, số tải đồng thời, số kết nối, số đoạn tối đa mỗi lượt tải, chính sách khi đóng cửa sổ.
 
-- **Tạm dừng/tiếp tục (Stage 1):** Pause hủy context của worker, chờ worker thoát rồi mới ghi `paused`, giữ nguyên file `.part`; Resume xếp hàng lại và tải lại từ đầu (chưa resume từ điểm dừng — cần HTTP Range, Stage 3). Nút Resume ghi rõ “tải lại từ đầu” để không gây hiểu lầm.
+- **Tạm dừng/tiếp tục (Stage 3):** Pause hủy context của worker, chờ worker thoát rồi mới ghi `paused`, giữ nguyên file `.part` và segment plan đã commit; Resume xếp hàng lại và tải tiếp từ byte đã commit khi server hỗ trợ Range (resume thật), tải lại từ đầu khi server không hỗ trợ Range hoặc validator đã đổi. Số đoạn tối đa mỗi lượt tải chỉnh được trong Settings (mặc định 4, cho phép 1–16, lưu cùng settings trong SQLite).
 
 Dùng widget danh sách có tái sử dụng item thay vì tạo hàng nghìn widget; snapshot chỉ chứa dữ liệu cần hiển thị. Đo CPU/render khi nhiều job thay đổi. Snapshot tổng hợp đưa vào `fyne.Do`; không giữ mutex trong lúc chờ UI. Tốc độ dựa trên chênh lệch byte/thời gian, ETA chỉ hiện khi có tổng và tốc độ đáng tin cậy.
 
@@ -306,9 +312,9 @@ PDM desktop process → validate → hộp thoại xác nhận → hàng đợi
 
 - Chia segment: file 0 byte, file nhỏ hơn số worker, chia dư, không overlap/gap.
 - `httptest` server: 206 đúng/sai Content-Range; server trả 200 khi có Range; 416; HEAD 405; redirect; unknown length; slow/stall; drop kết nối; 429/503 Retry-After; nội dung/ETag thay đổi.
-- Pause/resume tại nhiều offset; retry sau ngắt; cancel không ghi thêm sau khi hoàn tất; worker errors và cleanup. Kiểm tra output byte-for-byte bằng SHA-256 đối chiếu file fixture.
-- Crash simulation: kill sau write trước sync, sau sync trước DB commit, sau commit, trước/sau rename và trước `completed`; dữ liệu không bị ghép sai và không overwrite file đích. (Stage 2: chỉ test được phía DB commit + file `.part` qua recovery — xem `internal/app/crash_simulation_test.go`; checkpoint theo offset và resume thật là Stage 3.)
-- SQLite migration, khôi phục DB/file thiếu hoặc không nhất quán, hết dung lượng/quyền ghi, tên trùng, invalid path. (Stage 2: DB đóng/corrupt, orphan `.part`, tên trùng ở repo, invalid path ở service — xem `internal/storage/sqlite/crash_simulation_test.go` và `internal/app/crash_simulation_test.go`; hết dung lượng đĩa (ENOSPC) chưa mô phỏng được trong unit test.)
+- Pause/resume tại nhiều offset; retry sau ngắt; cancel không ghi thêm sau khi hoàn tất; worker errors và cleanup. Kiểm tra output byte-for-byte bằng SHA-256 đối chiếu file fixture. (Stage 3: pause/resume nhiều offset ở `TestResume_PauseResumeDownloadsOnlyRemainder` và `TestManager_ResumeAtMultipleOffsets`; retry sau ngắt ở `TestManager_TransientWorkerErrorRetries`; cancel sau hoàn tất ở `TestCrash_CancelAfterCompletedLeavesFinalUntouched`.)
+- Crash simulation: kill sau write trước sync, sau sync trước DB commit, sau commit, trước/sau rename và trước `completed`; dữ liệu không bị ghép sai và không overwrite file đích. (Stage 3: kill sau write trước sync và sau sync trước commit qua `internal/engine/checkpoint_test.go` và `TestManager_CommitFailureKeepsNothingCommitted`; sau commit qua resume từ plan đã commit ở `internal/engine/crash_simulation_test.go` (`TestManager_ResumeAtMultipleOffsets`) và `internal/storage/sqlite/crash_simulation_stage3_test.go` (committed segments sống qua reopen); trước/sau rename và trước `completed` qua recovery `finalizing` ở `internal/app/recovery_finalizing_test.go` và `internal/app/crash_simulation_test.go`; cancel sau khi hoàn tất không chạm file đích ở `internal/app/crash_simulation_stage3_test.go`.)
+- SQLite migration, khôi phục DB/file thiếu hoặc không nhất quán, hết dung lượng/quyền ghi, tên trùng, invalid path. (Stage 3: DB đóng/corrupt, orphan `.part`, tên trùng ở repo, invalid path ở service — xem `internal/storage/sqlite/crash_simulation_test.go` và `internal/app/crash_simulation_test.go`; hết dung lượng đĩa (ENOSPC) mô phỏng được qua `/dev/full` ở `TestManager_FullDiskWriteFailsFilesystemError`, lỗi ghi ở worker qua `TestWorker_WriteErrorFailsWithoutProgress` — xem `internal/engine/crash_simulation_test.go`.)
 - Dùng `go test ./...` và `go test -race ./...` trên môi trường có toolchain phù hợp; race detector không phát hiện mọi lỗi crash hay filesystem.
 - Test tay Fyne/tray, DPI, accessibility, mở/đóng, sleep/wake, proxy và đường truyền chập chờn trên từng OS.
 
@@ -327,7 +333,7 @@ PDM desktop process → validate → hộp thoại xác nhận → hàng đợi
 | 0. Bootstrap | Go module, Fyne window chạy được, CI cơ bản. |
 | 1. Single stream | Thêm URL, tải một luồng vào `.part`, hiển thị và hủy an toàn. |
 | 2. Queue + persistence | SQLite migrations, scheduler, restart recovery, trạng thái rõ ràng. (Đã triển khai.) |
-| 3. Range + resume | Probe, segment, validator, checkpoint, pause/resume và test crash. |
+| 3. Range + resume | Probe, segment, validator, checkpoint, pause/resume và test crash. (Đã triển khai.) |
 | 4. Desktop UX | Tray, settings, packaging, lỗi dễ hiểu, kiểm thử từng OS. |
 | 5. Browser | Extension, native host, IPC và phân tích bảo mật riêng. |
 | 6. Tối ưu | Profile CPU/RAM/disk, benchmark; chỉ cân nhắc tách daemon khi có số liệu. |

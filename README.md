@@ -3,7 +3,7 @@
 Desktop HTTP/HTTPS download manager built with Go and Fyne v2. It runs as a single
 desktop process and downloads files over plain HTTP/HTTPS.
 
-## Current implementation status (Stage 2)
+## Current implementation status (Stage 3)
 
 Implemented today:
 
@@ -36,15 +36,24 @@ Implemented today:
   success. The scheduler is separated from the service
   (`internal/scheduler`: max 3 active downloads, max 4 connections per
   host). On restart, `probing`/`downloading` jobs from the previous
-  session are re-queued to download again from the beginning (a job
-  whose `.part` file is gone although bytes were downloaded is marked
-  `failed` instead); a `finalizing` job is marked `failed` because the
-  durable metadata cannot verify the finalized file. Shutdown
+  session are re-queued and resume from their committed segment plan
+  when the server still supports Range and the validators match
+  (otherwise they download again from the beginning; a job whose
+  `.part` file is gone although bytes were downloaded is marked
+  `failed` instead); a `finalizing` job is reconciled — it completes
+  when every segment is committed, the `.part` size matches, and the
+  validators still match, and is marked `failed` otherwise. Shutdown
   checkpoints the current state and closes the database.
-- Pause/Resume: pausing an active download stops its worker, keeps the
-  `.part` file, and parks the job in `paused`; resuming re-queues it and
-  downloads again from the beginning (Stage 1 has no HTTP Range resume —
-  that comes in Stage 3). The Resume button says so on the label.
+- Pause/Resume (Stage 3, real resume): pausing an active download stops
+  its worker, keeps the `.part` file and the committed segment plan,
+  and parks the job in `paused`; resuming re-queues it and continues
+  from the committed bytes when the server supports HTTP Range (only
+  the remaining ranges are fetched, verified byte-for-byte by SHA-256
+  in tests). When the server does not support Range, or the validators
+  changed, resuming downloads again from the beginning instead of
+  joining bytes from different versions. The maximum number of
+  segments per download is configurable in Settings (default 4,
+  allowed 1–16) and is stored with the other settings in SQLite.
 - Fyne desktop UI (ARCHITECTURE section 10): downloads list with progress,
   speed, ETA and redacted source; Add URL dialog (URL and filename validated
   with `platform`); Settings dialog (default directory, duplicate-file
@@ -55,10 +64,18 @@ Implemented today:
 - Race-safe `internal/app` service: `sync.RWMutex`-guarded state, listener
   invoked without holding the lock, and idempotent `Shutdown`.
 
-Planned in later stages (see `docs/ARCHITECTURE.md` §§9, 6, 10):
+Implemented in Stage 3 (see `docs/ARCHITECTURE.md` §§5, 6, 8, 10, 13):
 
-- **Stage 3 — multi-segment HTTP Range resume** (parallel segments,
-  stall/ retry policy beyond the single-stream engine).
+- **Multi-segment HTTP Range downloads** (`engine.Manager`): the probe
+  verifies Range with `GET Range: bytes=0-0`, the file is split into
+  segments (plan persisted in SQLite before any worker starts),
+  workers fetch only their segment's remaining range with `If-Range`,
+  checkpoints sync the file before recording offsets, and finalize
+  verifies the size before the no-clobber rename. The single-stream
+  engine remains as the fallback for servers without Range.
+
+Planned in later stages:
+
 - **Stage 4 — system tray** (hide-to-tray, tray menu: Open, Pause All, Quit).
 
 ## Data and backup
@@ -70,7 +87,9 @@ database — then copy `pdm.db`. To reset all downloads and settings,
 quit the app and delete `pdm.db` (plus `pdm.db-wal` / `pdm.db-shm` if
 present). The `.part` files in the download folders are not part of
 the backup: a restored database re-queues unfinished jobs, which
-download again from the beginning.
+resume from their committed segments when the server still supports
+Range and the validators match, and download again from the beginning
+otherwise.
 
 ## Architecture
 

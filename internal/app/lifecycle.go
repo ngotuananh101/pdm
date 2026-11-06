@@ -111,9 +111,11 @@ func (s *Service) installRestoredLocked(d *domain.Download) (bool, error) {
 // downloading when the previous process ended (the confirmed Stage 2
 // decision), or fails it when its .part file is gone although the
 // persisted metadata says bytes were already downloaded. Caller must
-// hold s.mu. The job restarts from scratch on dispatch (Stage 1 has
-// no Range resume); the .part file, if present, is truncated by the
-// engine. Nothing is deleted here.
+// hold s.mu. On dispatch the job resumes from the stored segment
+// plan when the server still supports Range and the validators
+// match (Stage 3); only when there is no usable plan does the
+// engine start from scratch. The .part file, if present, is kept,
+// never truncated on a resume. Nothing is deleted here.
 //
 // The status is assigned directly instead of going through
 // setStatusLocked: probing/downloading -> queued is not a live
