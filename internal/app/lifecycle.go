@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ngotuananh101/pdm/internal/domain"
+	"github.com/ngotuananh101/pdm/internal/engine"
 )
 
 // LoadFromRepository restores every persisted download into the
@@ -145,29 +146,125 @@ func (s *Service) recoverInterruptedLocked(j *job) (bool, error) {
 }
 
 // reconcileFinalizingLocked reconciles a job that was finalizing when
-// the previous process ended (ARCH §8). In Stage 2 the outcome is
-// always failed: the durable metadata cannot verify the finalized
-// file — DownloadedBytes/TotalBytes only reach the DB at status
-// transitions, and at the finalizing transition they are still 0/-1,
-// so neither size nor validator can be checked, and ARCH §5 forbids
-// marking a job completed merely because a file exists. The .part
-// and destination are still inspected so the error message says
-// whether the rename may have happened; nothing is deleted or
-// overwritten, and Retry re-downloads from scratch.
+// the previous process ended (ARCH §8, Stage 3 Phase 4.3). It replaces
+// the Stage 2 behaviour (finalizing always failed): the job can now
+// complete when the durable state verifies.
+//
+// Verification, in order — any step that cannot be verified fails
+// the job, and nothing is deleted or overwritten:
+//
+//  1. The .part file must exist. Without it there is nothing to
+//     rename, and ARCH §5 forbids marking a job completed merely
+//     because a file exists at the destination.
+//  2. The expected total must be known and the .part size must match
+//     it exactly.
+//  3. When a segment plan exists, every segment must be complete,
+//     committed in full, and the plan must cover exactly
+//     [0, TotalBytes-1]. A Range job whose plan cannot be read
+//     (no segment repository) cannot be verified either.
+//  4. A fresh probe must agree with the stored validators (strong
+//     ETag, else Last-Modified) and total size; a probe failure or
+//     a mismatch means the resource changed or cannot be verified.
+//  5. engine.Finalize syncs and renames the .part file. Only after
+//     the rename succeeds is the job completed, with FinalPath
+//     persisted at the same transition.
+//
+// The probe and the rename run while the service lock is held: this
+// runs at startup, before any live operation can touch the job, so
+// no worker or UI action can race it. The status is assigned
+// directly (as in recoverInterruptedLocked): recovery re-states
+// where the job stands, it does not move a running job.
 func (s *Service) reconcileFinalizingLocked(j *job) (bool, error) {
 	d := &j.download
-	partGone := !restoredPartExists(d)
-	finalExists := d.FinalPath != "" && fileExists(d.FinalPath)
-	d.Status = domain.StatusFailed
-	d.ErrorCode = domain.ErrorCodeFilesystem
-	switch {
-	case !partGone:
-		d.ErrorMessage = "finalize did not complete: temporary file is still present; retry to download again"
-	case finalExists:
-		d.ErrorMessage = "could not verify the finalized file after restart: a file exists at the destination, check it before retrying"
-	default:
-		d.ErrorMessage = "finalize did not complete and no finished file was found; retry to download again"
+	fail := func(code domain.ErrorCode, msg string) (bool, error) {
+		d.Status = domain.StatusFailed
+		d.ErrorCode = code
+		d.ErrorMessage = msg
+		d.SpeedBytesPerSec = 0
+		d.ETASeconds = -1
+		d.UpdatedAt = time.Now().UTC()
+		if err := s.persistLocked(j); err != nil {
+			return false, fmt.Errorf("app: persist recovered job %q: %w", d.ID, err)
+		}
+		return false, nil
 	}
+
+	partPath := restoredTempPath(d)
+	fi, err := os.Stat(partPath)
+	if err != nil {
+		// No .part to finalize from. The rename may or may not
+		// have happened, but the file at the destination cannot
+		// be verified as this job's output, so the job fails and
+		// Retry re-downloads. Nothing is deleted or overwritten.
+		if d.FinalPath != "" && fileExists(d.FinalPath) {
+			return fail(domain.ErrorCodeFilesystem, "could not verify the finalized file after restart: a file exists at the destination, check it before retrying")
+		}
+		return fail(domain.ErrorCodeFilesystem, "finalize did not complete and no finished file was found; retry to download again")
+	}
+	if d.TotalBytes <= 0 {
+		return fail(domain.ErrorCodeFilesystem, "could not verify the finalized file after restart: expected size is unknown; retry to download again")
+	}
+	if fi.Size() != d.TotalBytes {
+		return fail(domain.ErrorCodeFilesystem, fmt.Sprintf("finalize did not complete: temporary file has %d bytes, expected %d; retry to download again", fi.Size(), d.TotalBytes))
+	}
+	if s.segRepo != nil {
+		segs, err := s.segRepo.GetByDownload(context.Background(), d.ID)
+		if err != nil {
+			return fail(domain.ErrorCodeFilesystem, "could not verify the finalized file after restart: segment plan could not be read; retry to download again")
+		}
+		if len(segs) > 0 {
+			var committed, expect int64
+			for i, sg := range segs {
+				if sg == nil || sg.Index != i || sg.StartOffset != expect ||
+					sg.Status != domain.SegmentComplete || sg.CommittedBytes != sg.Size() {
+					return fail(domain.ErrorCodeFilesystem, "finalize did not complete: not all segments are committed; retry to download again")
+				}
+				committed += sg.CommittedBytes
+				expect = sg.EndOffset + 1
+			}
+			if committed != d.TotalBytes || expect != d.TotalBytes {
+				return fail(domain.ErrorCodeFilesystem, "finalize did not complete: segment plan does not cover the expected size; retry to download again")
+			}
+		}
+		// No segments: a single-stream job; the size check above
+		// and the validator check below are the verification.
+	} else if d.SupportsRange {
+		// A Range job's .part size alone cannot prove every
+		// segment is committed (holes read as zeros), and the plan
+		// is unavailable: fail rather than complete unverified.
+		return fail(domain.ErrorCodeFilesystem, "could not verify the finalized file after restart: segment plan is unavailable; retry to download again")
+	}
+	if s.prober != nil {
+		pr, err := s.prober.Probe(context.Background(), d.URL)
+		if err != nil {
+			return fail(domain.ErrorCodeFilesystem, "could not verify the finalized file after restart: validator check failed; retry to download again")
+		}
+		if pr.TotalBytes >= 0 && pr.TotalBytes != d.TotalBytes {
+			return fail(domain.ErrorCodeFilesystem, "finalize did not complete: the resource size changed since the download; retry to download again")
+		}
+		if d.ETag != "" && pr.ETag != d.ETag {
+			return fail(domain.ErrorCodeFilesystem, "finalize did not complete: the resource changed since the download (validator mismatch); retry to download again")
+		}
+		if d.ETag == "" && d.LastModified != "" && pr.LastModified != d.LastModified {
+			return fail(domain.ErrorCodeFilesystem, "finalize did not complete: the resource changed since the download (validator mismatch); retry to download again")
+		}
+	} else if d.ETag != "" || d.LastModified != "" {
+		return fail(domain.ErrorCodeFilesystem, "could not verify the finalized file after restart: validator check is unavailable; retry to download again")
+	}
+	finalPath, finalName, ferr := engine.Finalize(partPath, d.DestinationDir, d.Filename, j.finalizeMode, d.TotalBytes)
+	if ferr != nil {
+		// The rename failed (conflict, symlink, directory, ...):
+		// the .part is intact, the job fails, and Retry or
+		// conflict resolution can deal with it.
+		return fail(domain.ErrorCodeFilesystem, "finalize did not complete: "+domain.SanitizeErrorText(ferr.Error())+"; retry to download again")
+	}
+	d.FinalPath = finalPath
+	d.Filename = finalName
+	d.TempPath = ""
+	d.DownloadedBytes = d.TotalBytes
+	d.Status = domain.StatusCompleted
+	d.ErrorCode = ""
+	d.ErrorMessage = ""
 	d.SpeedBytesPerSec = 0
 	d.ETASeconds = -1
 	d.UpdatedAt = time.Now().UTC()

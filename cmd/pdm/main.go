@@ -71,6 +71,15 @@ func main() {
 		// never prevent startup: the app continues with an empty
 		// queue and the next startup retries recovery.
 		coreSvc.SetDownloadRepository(sqlite.NewDownloadRepository(db.DB))
+		// Stage 3, Phase 4.4: run downloads through the manager
+		// (probe + segmented workers with resume, single-stream
+		// fallback), with the segment repository it resumes from
+		// and restart recovery reconciles against. Wired before
+		// LoadFromRepository so recovery can verify finalizing
+		// jobs.
+		segRepo := sqlite.NewSegmentRepository(db.DB)
+		coreSvc.SetSegmentRepository(segRepo)
+		coreSvc.SetManager(engine.NewManager(cfg, httpClient, nil, segRepo))
 		if err := coreSvc.LoadFromRepository(context.Background()); err != nil {
 			logger.Warn("pdm: could not restore previous downloads", "err", err)
 		}

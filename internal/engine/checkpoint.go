@@ -32,6 +32,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"time"
@@ -59,6 +60,14 @@ type Checkpointer struct {
 	// in storage per segment, so a stale note can never ask storage
 	// to regress.
 	published map[int]int64
+	// publishMu serializes the publish section of Checkpoint
+	// (filter + record loop). Two concurrent Checkpoints — the
+	// periodic ticker and the per-segment completion checkpoint —
+	// must not interleave their publishes: the filter has to see
+	// every value the other call already recorded, so a stale
+	// snapshot is skipped instead of tripping the repository's
+	// monotonic check. The file Sync stays outside this mutex.
+	publishMu sync.Mutex
 }
 
 // NewCheckpointer creates a checkpointer for the .part file f. repo
@@ -99,9 +108,20 @@ func (c *Checkpointer) NoteWritten(index int, committedBytes int64) {
 	}
 }
 
-// Checkpoint publishes the dirty offsets in §8 order: sync the file
-// first, then record the snapshotted offsets in storage. On any
-// error the job must stop and storage stays at the last good values.
+// Two Checkpoint calls can run concurrently — the periodic ticker
+// and the per-segment completion checkpoint — so a snapshot can go
+// stale while its Sync is in flight: another call may publish a
+// newer value for the same segment first. Publishing the stale value
+// would trip the repository's monotonic check and wrongly fail the
+// job, so stale entries are skipped: the filter below runs under
+// publishMu (which serializes the whole publish section, so the
+// filter always sees what the other call already recorded), the
+// published high-water mark advances immediately after each
+// successful record (not only at the end), and an UpdateCommitted
+// that still reports a regression already covered by the high-water
+// mark is skipped rather than treated as a failure. Skipping is
+// safe: the newer value was itself synced before it was published,
+// so storage already holds at least the skipped amount.
 func (c *Checkpointer) Checkpoint(ctx context.Context) error {
 	c.mu.Lock()
 	snapshot := make(map[int]int64, len(c.dirty))
@@ -118,15 +138,52 @@ func (c *Checkpointer) Checkpoint(ctx context.Context) error {
 		return codeError(domain.ErrorCodeFilesystem, "checkpoint: sync: "+err.Error(), err)
 	}
 
+	// Serialize the publish section: filter + record loop run
+	// atomically against other Checkpoint calls.
+	c.publishMu.Lock()
+	defer c.publishMu.Unlock()
+
+	// Drop snapshot entries a concurrent Checkpoint already
+	// published at or above this value.
+	c.mu.Lock()
+	for idx, committed := range snapshot {
+		if committed <= c.published[idx] {
+			delete(snapshot, idx)
+		}
+	}
+	c.mu.Unlock()
+	if len(snapshot) == 0 {
+		return nil
+	}
+
 	published := make([]int, 0, len(snapshot))
 	if c.repo != nil {
 		for idx, committed := range snapshot {
 			if err := c.repo.UpdateCommitted(ctx, c.downloadID, idx, committed); err != nil {
+				// A concurrent Checkpoint may have published a
+				// newer value for this segment after the filter
+				// above: if storage already holds at least this
+				// much, the entry is stale, not a real failure.
+				c.mu.Lock()
+				already := c.published[idx] >= committed
+				c.mu.Unlock()
+				if already && errors.Is(err, domain.ErrCommittedBytesRegression) {
+					published = append(published, idx)
+					continue
+				}
 				// Keep the unpublished entries dirty for the next
 				// checkpoint; only the published ones are dropped.
 				c.dropPublished(published, snapshot)
 				return codeError(domain.ErrorCodeFilesystem, "checkpoint: record committed bytes: "+err.Error(), err)
 			}
+			// Advance the high-water mark immediately, so a
+			// concurrent Checkpoint filtering or failing right
+			// now sees this value instead of a stale one.
+			c.mu.Lock()
+			if committed > c.published[idx] {
+				c.published[idx] = committed
+			}
+			c.mu.Unlock()
 			published = append(published, idx)
 		}
 	} else {

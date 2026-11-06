@@ -92,6 +92,15 @@ type Service struct {
 	// download starts (Stage 3, Phase 2). A nil prober skips
 	// probing: the job runs single-stream with no validators.
 	prober engine.RangeProber
+	// manager runs downloads through probe + segmented workers with
+	// resume (Stage 3, Phase 4.4). A nil manager keeps the
+	// pre-Phase-4 path: the single-stream downloader directly.
+	manager engine.ManagerRunner
+	// segRepo holds the segment plans the manager resumes from and
+	// restart recovery reconciles against (Stage 3, Phase 4). A nil
+	// repo means no plan is available: the manager runs without
+	// persistence and recovery cannot verify segments.
+	segRepo domain.SegmentRepository
 	// repo persists every status change (Phase 5.1). A nil repo
 	// means the service runs RAM-only, exactly like Stage 1.
 	repo     domain.DownloadRepository
@@ -169,6 +178,25 @@ func (s *Service) SetDownloadRepository(repo domain.DownloadRepository) {
 func (s *Service) SetProber(p engine.RangeProber) {
 	s.mu.Lock()
 	s.prober = p
+	s.mu.Unlock()
+}
+
+// SetManager attaches (or replaces) the download manager used by
+// run() (Stage 3, Phase 4.4). A nil manager restores the direct
+// single-stream path.
+func (s *Service) SetManager(m engine.ManagerRunner) {
+	s.mu.Lock()
+	s.manager = m
+	s.mu.Unlock()
+}
+
+// SetSegmentRepository attaches (or replaces) the segment plan
+// repository used by the manager (resume) and by restart recovery
+// (Stage 3, Phase 4). A nil repository means no segment plans are
+// available.
+func (s *Service) SetSegmentRepository(r domain.SegmentRepository) {
+	s.mu.Lock()
+	s.segRepo = r
 	s.mu.Unlock()
 }
 
@@ -693,8 +721,9 @@ func (s *Service) Retry(id string) error {
 // keeps the .part file (TempPath is preserved) and never deletes
 // anything. A queued job that has not started yet is parked
 // without ever starting a worker. Resume re-queues a paused job;
-// Stage 1 has no HTTP Range resume, so the next worker downloads
-// from the beginning.
+// with the manager wired in (Stage 3, Phase 4.1) the next run
+// resumes from the committed bytes, otherwise it downloads from
+// the beginning.
 func (s *Service) Pause(id string) error {
 	// If a ResolveConflict is finalizing this job, wait for it to
 	// finish before deciding, exactly like Cancel (ARCH section 4):
@@ -816,12 +845,16 @@ func (s *Service) Pause(id string) error {
 	return nil
 }
 
-// Resume re-queues a paused download from the beginning (U3,
-// Phase 7). Stage 1 has no HTTP Range resume: the next worker
-// starts a fresh single-stream transfer — the engine opens the
-// preserved .part with O_TRUNC, so previously downloaded bytes
-// are fetched again. Resume only works from paused;
-// failed/cancelled jobs use Retry instead.
+// Resume re-queues a paused download (U3, Phase 7). When the
+// manager is wired in (Stage 3, Phase 4.1), the next run resumes
+// from the committed segment bytes instead of starting over: the
+// .part file and the segment plan are kept, complete segments are
+// skipped, and only the remaining ranges are fetched. Without the
+// manager (the pre-Phase-4 path) the next worker starts a fresh
+// single-stream transfer — the engine opens the preserved .part
+// with O_TRUNC, so previously downloaded bytes are fetched again.
+// Resume only works from paused; failed/cancelled jobs use Retry
+// instead.
 func (s *Service) Resume(id string) error {
 	s.mu.Lock()
 	j, ok := s.jobs[id]
@@ -1032,8 +1065,10 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 					// generation this resolve started. If another
 					// operation moved it meanwhile, leave that
 					// status untouched instead of overwriting it.
-					// finalizing -> completed is always allowed here.
-					_ = s.setStatusLocked(jj, domain.StatusCompleted)
+					// The outcome fields are set BEFORE the
+					// completed transition, so its persist already
+					// carries FinalPath (Phase 4.2: a crash between
+					// the rename and completed must not lose it).
 					jj.download.FinalPath = finalPath
 					jj.download.Filename = finalName
 					jj.download.TempPath = ""
@@ -1046,6 +1081,8 @@ func (s *Service) ResolveConflict(id string, res domain.ConflictResolution) erro
 					jj.download.SpeedBytesPerSec = 0
 					jj.download.ETASeconds = -1
 					jj.download.UpdatedAt = time.Now().UTC()
+					// finalizing -> completed is always allowed here.
+					_ = s.setStatusLocked(jj, domain.StatusCompleted)
 				}
 				s.mu.Unlock()
 				s.notify()
@@ -1202,6 +1239,38 @@ func (s *Service) applyProbeResultLocked(j *job, pr engine.ProbeResult) {
 	_ = s.persistLocked(j)
 }
 
+// runViaManager executes one job through the download manager
+// (Phase 4.4): probe, segmented workers with resume from the stored
+// plan, or the single-stream fallback. It returns the transfer
+// result and whether the segmented path was used — in that case the
+// .part file is left for the caller to finalize (Phase 4.2); the
+// single-stream fallback finalizes itself. expectedETag and
+// expectedTotal are the validators recorded for the previous
+// generation of this job, used to decide resume vs restart.
+func (s *Service) runViaManager(ctx context.Context, mgr engine.ManagerRunner, id, url, destDir, filename, tempPath, expectedETag string, expectedTotal int64, mode domain.FinalizeMode) (domain.TransferResult, bool, error) {
+	res, err := mgr.Run(ctx, engine.ManagerRequest{
+		ID:                 id,
+		URL:                url,
+		DestinationDir:     destDir,
+		Filename:           filename,
+		TempPath:           tempPath,
+		Mode:               mode,
+		ExpectedETag:       expectedETag,
+		ExpectedTotalBytes: expectedTotal,
+		OnProgress: func(pu domain.ProgressUpdate) {
+			s.onProgress(id, pu)
+		},
+	})
+	out := domain.TransferResult{
+		FinalPath:    res.FinalPath,
+		Filename:     res.Filename,
+		TempPath:     res.TempPath,
+		WrittenBytes: res.WrittenBytes,
+		TotalBytes:   res.TotalBytes,
+	}
+	return out, res.UsedSegments, err
+}
+
 // run executes one job. done is closed (via defer) only after the
 // engine has returned and all file handles are closed.
 func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
@@ -1246,7 +1315,14 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 		return
 	}
 	prober := s.prober
+	manager := s.manager
 	url := j.download.URL
+	// Validators recorded for the previous generation (if any):
+	// the manager compares them with its fresh probe to decide
+	// resume vs restart from scratch (Phase 4.1, decision 2).
+	// They are captured before this run's probe overwrites them.
+	expectedETag := j.download.ETag
+	expectedTotal := j.download.TotalBytes
 	s.mu.Unlock()
 
 	// Probe for Range support and validators while the job is still
@@ -1293,20 +1369,48 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 	// mode are captured here.
 	destDir := j.download.DestinationDir
 	filename := j.download.Filename
+	tempPath := j.download.TempPath
 	mode := j.finalizeMode
 	s.mu.Unlock()
 	s.notify()
 
-	res, err := s.downloader.Download(ctx, domain.TransferRequest{
-		ID:             id,
-		URL:            url,
-		DestinationDir: destDir,
-		Filename:       filename,
-		Mode:           mode,
-		OnProgress: func(pu domain.ProgressUpdate) {
-			s.onProgress(id, pu)
-		},
-	})
+	var res domain.TransferResult
+	var usedSegments bool
+	var err error
+	if manager != nil {
+		res, usedSegments, err = s.runViaManager(ctx, manager, id, url, destDir, filename, tempPath, expectedETag, expectedTotal, mode)
+	} else {
+		res, err = s.downloader.Download(ctx, domain.TransferRequest{
+			ID:             id,
+			URL:            url,
+			DestinationDir: destDir,
+			Filename:       filename,
+			Mode:           mode,
+			OnProgress: func(pu domain.ProgressUpdate) {
+				s.onProgress(id, pu)
+			},
+		})
+	}
+
+	// A segmented download leaves the .part file for finalize
+	// (Phase 4.2): verify its size and rename it here, so both
+	// paths share the same completion rule. A finalize failure is
+	// a download failure: the .part stays intact for retry or
+	// conflict resolution, and the error flows through the usual
+	// failure branches below (including file_conflict).
+	if err == nil && usedSegments && res.FinalPath == "" {
+		finalName := res.Filename
+		if finalName == "" {
+			finalName = filename
+		}
+		finalPath, resolvedName, ferr := engine.Finalize(res.TempPath, destDir, finalName, mode, res.TotalBytes)
+		if ferr != nil {
+			err = ferr
+		} else {
+			res.FinalPath = finalPath
+			res.Filename = resolvedName
+		}
+	}
 
 	s.mu.Lock()
 	j, ok = s.jobs[id]
@@ -1319,20 +1423,12 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 
 	if err == nil {
 		// downloading -> finalizing -> completed (ARCH §5). The
-		// engine already finalized the file; record the intermediate
-		// state (and notify while in it) so observers never see
+		// file is already finalized; record the outcome fields
+		// BEFORE the finalizing transition, so the transition's
+		// persist already carries FinalPath (Phase 4.2: a crash
+		// between finalize and completed must not lose it). Then
+		// notify while in finalizing, so observers never see
 		// downloading jump straight to completed.
-		if serr := s.setStatusLocked(j, domain.StatusFinalizing); serr != nil {
-			// Unreachable: no other goroutine may move a running
-			// job out of downloading. Report failure rather than
-			// a completion that was never recorded.
-			j.download.ErrorMessage = domain.SanitizeErrorText(serr.Error())
-			// downloading -> failed is always allowed here.
-			_ = s.setStatusLocked(j, domain.StatusFailed)
-			s.mu.Unlock()
-			s.notify()
-			return
-		}
 		j.download.FinalPath = res.FinalPath
 		if res.Filename != "" {
 			j.download.Filename = res.Filename
@@ -1346,6 +1442,17 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 		j.download.SuggestedFilename = ""
 		j.download.SpeedBytesPerSec = 0
 		j.download.ETASeconds = -1
+		if serr := s.setStatusLocked(j, domain.StatusFinalizing); serr != nil {
+			// Unreachable: no other goroutine may move a running
+			// job out of downloading. Report failure rather than
+			// a completion that was never recorded.
+			j.download.ErrorMessage = domain.SanitizeErrorText(serr.Error())
+			// downloading -> failed is always allowed here.
+			_ = s.setStatusLocked(j, domain.StatusFailed)
+			s.mu.Unlock()
+			s.notify()
+			return
+		}
 		s.mu.Unlock()
 		s.notify()
 		s.mu.Lock()

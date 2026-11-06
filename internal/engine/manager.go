@@ -22,7 +22,18 @@
 // The manager does NOT finalize: the segmented path leaves the
 // .part file in place for Phase 4.2 (finalize) to verify and rename.
 // The single-stream fallback still finalizes immediately, as
-// SingleDownloader does today; Phase 4 unifies the two paths.
+// SingleDownloader does today; Phase 4 unifies the two paths at the
+// service layer.
+//
+// Resume (Phase 4.1): when the segment repository already holds a
+// plan for this download ID that covers the probed size and the
+// fresh probe agrees with the caller's expected validators, the run
+// resumes from the plan: complete segments are never re-requested,
+// a segment left running by a previous session continues from its
+// committed bytes, and the .part file is opened without O_TRUNC. A
+// plan that does not cover the size, or whose resource changed
+// (validator/total mismatch), is discarded with its .part file and
+// the job restarts from scratch (decision 2).
 //
 // Segments per download: config.SegmentsPerDownload when positive,
 // otherwise DefaultSegmentsPerDownload (4). The setting is already
@@ -45,6 +56,14 @@ import (
 	"github.com/ngotuananh101/pdm/internal/domain"
 	"github.com/ngotuananh101/pdm/internal/platform"
 )
+
+// ManagerRunner is the interface the app service uses to run a
+// download through the manager (Phase 4.4). Manager satisfies it.
+type ManagerRunner interface {
+	Run(ctx context.Context, req ManagerRequest) (ManagerResult, error)
+}
+
+var _ ManagerRunner = (*Manager)(nil)
 
 // Manager runs one download job: probe, segmented workers, or the
 // single-stream fallback.
@@ -89,6 +108,15 @@ type ManagerRequest struct {
 	TempPath       string
 	Mode           domain.FinalizeMode
 	OnProgress     func(domain.ProgressUpdate)
+	// ExpectedETag / ExpectedTotalBytes are the validators the
+	// caller recorded for a previous generation of this job (e.g.
+	// before a Pause). When set, a stored segment plan is only
+	// resumed when the fresh probe agrees with them; a mismatch
+	// means the resource changed and the plan is discarded
+	// (decision 2). Empty/<=0 means "no prior information": any
+	// stored plan that covers the probed size may be resumed.
+	ExpectedETag       string
+	ExpectedTotalBytes int64
 }
 
 // ManagerResult is the outcome of a manager run. FinalPath is set
@@ -149,11 +177,85 @@ func (m *Manager) Run(ctx context.Context, req ManagerRequest) (ManagerResult, e
 	if !probe.SupportsRange || probe.TotalBytes <= 0 {
 		return m.runSingle(ctx, req, destDir, filename, tempPath)
 	}
-	return m.runSegmented(ctx, req, parsedURL, destDir, filename, tempPath, probe, false)
+	// Resume (Phase 4.1): reuse a stored plan when it covers the
+	// probed size and the fresh probe agrees with the validators
+	// the caller recorded for the previous generation. A stale
+	// plan is discarded with its .part file, never resumed.
+	var resume []domain.Segment
+	if m.segRepo != nil {
+		if plan, err := m.segRepo.GetByDownload(ctx, req.ID); err == nil && len(plan) > 0 {
+			if planCovers(plan, probe.TotalBytes) && resumeValidatorMatches(req, probe) {
+				resume = make([]domain.Segment, len(plan))
+				for i, s := range plan {
+					resume[i] = *s
+				}
+			} else {
+				_ = m.segRepo.DeleteByDownload(ctx, req.ID)
+				_ = os.Remove(tempPath)
+			}
+		}
+	}
+	return m.runSegmented(ctx, req, parsedURL, destDir, filename, tempPath, probe, false, resume)
 }
 
-// runSingle delegates to the single-stream downloader.
+// planCovers reports whether plan covers exactly [0, totalBytes-1]
+// with contiguous, well-formed segments in index order, each with a
+// committed count inside its range and a known status.
+func planCovers(plan []*domain.Segment, totalBytes int64) bool {
+	if len(plan) == 0 || totalBytes <= 0 {
+		return false
+	}
+	var expect int64
+	for i, s := range plan {
+		if s == nil || s.Index != i || s.StartOffset != expect {
+			return false
+		}
+		if s.EndOffset < s.StartOffset || s.CommittedBytes < 0 || s.CommittedBytes > s.Size() {
+			return false
+		}
+		switch s.Status {
+		case domain.SegmentPending, domain.SegmentRunning, domain.SegmentComplete:
+		default:
+			return false
+		}
+		expect = s.EndOffset + 1
+	}
+	return expect == totalBytes
+}
+
+// resumeValidatorMatches reports whether the fresh probe agrees with
+// the validators the caller recorded for a previous generation. An
+// empty expected ETag (or a non-positive expected total) means the
+// caller recorded nothing: any covering plan may be resumed.
+func resumeValidatorMatches(req ManagerRequest, probe ProbeResult) bool {
+	if req.ExpectedTotalBytes > 0 && req.ExpectedTotalBytes != probe.TotalBytes {
+		return false
+	}
+	if req.ExpectedETag != "" && req.ExpectedETag != probe.ETag {
+		return false
+	}
+	return true
+}
+
+// writtenSoFar sums the in-memory committed bytes of segments: the
+// bytes this run (and any resumed previous run) has written, used to
+// report progress on error returns.
+func writtenSoFar(segments []domain.Segment) int64 {
+	var total int64
+	for i := range segments {
+		total += segments[i].CommittedBytes
+	}
+	return total
+}
+
+// runSingle delegates to the single-stream downloader. A stored
+// segment plan does not describe a single-stream transfer, so it is
+// discarded first: a later retry must not resume from a plan whose
+// bytes came from a different transfer shape.
 func (m *Manager) runSingle(ctx context.Context, req ManagerRequest, destDir, filename, tempPath string) (ManagerResult, error) {
+	if m.segRepo != nil {
+		_ = m.segRepo.DeleteByDownload(ctx, req.ID)
+	}
 	res, err := m.single.Download(ctx, domain.TransferRequest{
 		ID:             req.ID,
 		URL:            req.URL,
@@ -179,8 +281,10 @@ func (m *Manager) runSingle(ctx context.Context, req ManagerRequest, destDir, fi
 // runSegmented downloads probe.TotalBytes with segment workers.
 // restarted is true when this is the single allowed restart after a
 // validator/size change; a second 200/416 fails the job instead of
-// looping forever.
-func (m *Manager) runSegmented(ctx context.Context, req ManagerRequest, parsedURL *url.URL, destDir, filename, tempPath string, probe ProbeResult, restarted bool) (ManagerResult, error) {
+// looping forever. resume, when non-empty, is a stored plan to
+// resume from (Phase 4.1): its committed bytes are kept and only
+// the remaining ranges are fetched.
+func (m *Manager) runSegmented(ctx context.Context, req ManagerRequest, parsedURL *url.URL, destDir, filename, tempPath string, probe ProbeResult, restarted bool, resume []domain.Segment) (ManagerResult, error) {
 	maxSegs := m.cfg.SegmentsPerDownload
 	if maxSegs <= 0 {
 		maxSegs = config.DefaultSegmentsPerDownload
@@ -189,35 +293,75 @@ func (m *Manager) runSegmented(ctx context.Context, req ManagerRequest, parsedUR
 	if minSeg <= 0 {
 		minSeg = config.DefaultMinSegmentSize
 	}
-	segments := domain.SplitSegments(probe.TotalBytes, maxSegs, minSeg)
-	for i := range segments {
-		segments[i].DownloadID = req.ID
-	}
 
 	// Refuse a symlink .part path before opening (same rule as single.go).
 	if fi, err := os.Lstat(tempPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return ManagerResult{}, fmt.Errorf("%w: %s", domain.ErrSymlinkTarget, tempPath)
 	}
-	// Fresh run: truncate any stale .part from an earlier attempt.
-	f, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+
+	resuming := len(resume) > 0
+	var segments []domain.Segment
+	if resuming {
+		segments = resume
+		for i := range segments {
+			// A segment left running by a previous session is
+			// pending again from its committed bytes; the worker
+			// re-marks it running when it starts.
+			if segments[i].Status == domain.SegmentRunning {
+				segments[i].Status = domain.SegmentPending
+			}
+		}
+		// Resume needs the .part file the plan describes: without
+		// it (or with fewer bytes than the plan claims committed)
+		// there is nothing safe to resume from, so drop the plan
+		// and restart from scratch below.
+		if fi, err := os.Stat(tempPath); err != nil || fi.Size() < writtenSoFar(segments) {
+			if m.segRepo != nil {
+				_ = m.segRepo.DeleteByDownload(ctx, req.ID)
+			}
+			_ = os.Remove(tempPath)
+			resuming = false
+		}
+	}
+	var f *os.File
+	var err error
+	if resuming {
+		// Resume: open WITHOUT O_TRUNC, so committed bytes stay.
+		f, err = os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE, 0o600)
+	} else {
+		segments = domain.SplitSegments(probe.TotalBytes, maxSegs, minSeg)
+		for i := range segments {
+			segments[i].DownloadID = req.ID
+		}
+		// Fresh run: truncate any stale .part from an earlier attempt.
+		f, err = os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	}
 	if err != nil {
 		return ManagerResult{}, codeError(domain.ErrorCodeFilesystem, "manager: open temp file: "+err.Error(), err)
 	}
 	defer f.Close()
 
-	// Persist the plan (segments + validators) BEFORE any worker
-	// starts, so a crash mid-download can resume from storage.
-	if m.segRepo != nil {
-		if err := m.segRepo.InsertPlan(ctx, req.ID, segments); err != nil {
-			return ManagerResult{}, codeError(domain.ErrorCodeFilesystem, "manager: store segment plan: "+err.Error(), err)
+	if !resuming {
+		// Persist the plan (segments + validators) BEFORE any worker
+		// starts, so a crash mid-download can resume from storage.
+		// Delete any stale plan first: a discarded resume plan (or
+		// a retry after Cancel with deleteTemp) would otherwise
+		// collide with the fresh insert.
+		if m.segRepo != nil {
+			_ = m.segRepo.DeleteByDownload(ctx, req.ID)
+			if err := m.segRepo.InsertPlan(ctx, req.ID, segments); err != nil {
+				return ManagerResult{}, codeError(domain.ErrorCodeFilesystem, "manager: store segment plan: "+err.Error(), err)
+			}
 		}
 	}
 
 	checkpointer := NewCheckpointer(f, m.segRepo, req.ID)
 
 	// Progress reporting: aggregate committed bytes across segments,
-	// throttled like the single-stream engine.
-	progress := &segmentProgress{total: probe.TotalBytes, filename: filename, onProgress: req.OnProgress, interval: m.progressInterval()}
+	// throttled like the single-stream engine. On resume the counter
+	// starts at the already-committed bytes, so progress reports
+	// the total downloaded, not just this run's remainder.
+	progress := &segmentProgress{total: probe.TotalBytes, filename: filename, onProgress: req.OnProgress, interval: m.progressInterval(), done: writtenSoFar(segments)}
 
 	jobCtx, jobCancel := context.WithCancel(ctx)
 	defer jobCancel()
@@ -267,6 +411,10 @@ func (m *Manager) runSegmented(ctx context.Context, req ManagerRequest, parsedUR
 	}
 feed:
 	for i := range segments {
+		if segments[i].CommittedBytes >= segments[i].Size() {
+			// Already complete (resumed plan): never re-requested.
+			continue
+		}
 		select {
 		case jobs <- i:
 		case <-jobCtx.Done():
@@ -279,7 +427,7 @@ feed:
 
 	if firstErr != nil {
 		if ctx.Err() != nil {
-			return ManagerResult{TempPath: tempPath, Filename: filename, TotalBytes: probe.TotalBytes}, ctx.Err()
+			return ManagerResult{TempPath: tempPath, Filename: filename, TotalBytes: probe.TotalBytes, WrittenBytes: writtenSoFar(segments)}, ctx.Err()
 		}
 		if (errors.Is(firstErr, ErrRangeIgnored) || errors.Is(firstErr, ErrRangeNotSatisfiable)) && !restarted {
 			// Close the .part handle first: the restart removes
@@ -288,18 +436,15 @@ feed:
 			_ = f.Close()
 			return m.restartAfterValidatorChange(ctx, req, parsedURL, destDir, filename, tempPath)
 		}
-		return ManagerResult{TempPath: tempPath, Filename: filename, TotalBytes: probe.TotalBytes}, firstErr
+		return ManagerResult{TempPath: tempPath, Filename: filename, TotalBytes: probe.TotalBytes, WrittenBytes: writtenSoFar(segments)}, firstErr
 	}
 
 	// Final checkpoint: sync the file and publish every remaining
 	// dirty offset before reporting success.
 	if err := checkpointer.Checkpoint(ctx); err != nil {
-		return ManagerResult{TempPath: tempPath, Filename: filename, TotalBytes: probe.TotalBytes}, err
+		return ManagerResult{TempPath: tempPath, Filename: filename, TotalBytes: probe.TotalBytes, WrittenBytes: writtenSoFar(segments)}, err
 	}
-	var written int64
-	for i := range segments {
-		written += segments[i].CommittedBytes
-	}
+	written := writtenSoFar(segments)
 	if written != probe.TotalBytes {
 		return ManagerResult{TempPath: tempPath, Filename: filename, TotalBytes: probe.TotalBytes, WrittenBytes: written},
 			codeError(domain.ErrorCodeSizeMismatch,
@@ -338,7 +483,7 @@ func (m *Manager) restartAfterValidatorChange(ctx context.Context, req ManagerRe
 	if !newProbe.SupportsRange || newProbe.TotalBytes <= 0 {
 		return m.runSingle(ctx, req, destDir, filename, tempPath)
 	}
-	return m.runSegmented(ctx, req, parsedURL, destDir, filename, tempPath, newProbe, true)
+	return m.runSegmented(ctx, req, parsedURL, destDir, filename, tempPath, newProbe, true, nil)
 }
 
 // downloadSegmentWithRetry downloads one segment with bounded

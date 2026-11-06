@@ -129,9 +129,18 @@ func (s *managerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.mode == "flaky" && !isProbe {
+	// Record every non-probe ranged request, so resume tests can
+	// assert exactly which ranges were (re-)requested. The probe
+	// (bytes=0-0) is excluded; the flaky first attempt counts too,
+	// so a retried range reaches 2 calls.
+	if !isProbe {
 		s.mu.Lock()
 		s.rangeCalls[rangeHeader]++
+		s.mu.Unlock()
+	}
+
+	if s.mode == "flaky" && !isProbe {
+		s.mu.Lock()
 		calls := s.rangeCalls[rangeHeader]
 		s.mu.Unlock()
 		if calls == 1 {
@@ -164,6 +173,18 @@ func (s *managerServer) probeCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.probes
+}
+
+// rangedRequests returns a copy of the per-range request counts,
+// excluding the probe (bytes=0-0).
+func (s *managerServer) rangedRequests() map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]int, len(s.rangeCalls))
+	for k, v := range s.rangeCalls {
+		out[k] = v
+	}
+	return out
 }
 
 func newManagerTest(t *testing.T, mode string, size int) (*managerServer, *httptest.Server, *Manager, *fakeSegmentRepo) {

@@ -190,6 +190,75 @@ func TestCheckpoint_NeverRegresses(t *testing.T) {
 	}
 }
 
+// gateSyncer blocks its first Sync until released, then passes
+// through. It lets a test hold one Checkpoint inside Sync while a
+// second Checkpoint publishes a newer value.
+type gateSyncer struct {
+	mu           sync.Mutex
+	calls        int
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+}
+
+func (g *gateSyncer) Sync() error {
+	g.mu.Lock()
+	g.calls++
+	first := g.calls == 1
+	g.mu.Unlock()
+	if first {
+		close(g.firstStarted)
+		<-g.releaseFirst
+	}
+	return nil
+}
+
+func TestCheckpoint_StaleSnapshotDoesNotRegress(t *testing.T) {
+	repo := newFakeSegmentRepo()
+	checkpointPlan(t, repo)
+
+	syncer := &gateSyncer{
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+	cp := NewCheckpointerWithSyncer(syncer, repo, "d1")
+	ctx := context.Background()
+
+	cp.NoteWritten(0, 50)
+	// Checkpoint #1 snapshots {0: 50} and blocks inside Sync.
+	err1 := make(chan error, 1)
+	go func() { err1 <- cp.Checkpoint(ctx) }()
+	select {
+	case <-syncer.firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Checkpoint never reached Sync")
+	}
+	// Meanwhile a newer value is noted and published by
+	// Checkpoint #2 (this is the segment-completion checkpoint
+	// racing the periodic one in a real download).
+	cp.NoteWritten(0, 100)
+	if err := cp.Checkpoint(ctx); err != nil {
+		t.Fatalf("Checkpoint #2: %v", err)
+	}
+	if got := committedOf(t, repo, 0); got != 100 {
+		t.Fatalf("committed[0] = %d, want 100", got)
+	}
+	// Release #1: its snapshot (50) is stale — it must succeed
+	// without touching storage, not fail with a regression error
+	// that would stop the whole job.
+	close(syncer.releaseFirst)
+	select {
+	case err := <-err1:
+		if err != nil {
+			t.Fatalf("stale Checkpoint #1 = %v, want nil (already-published values must be skipped)", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Checkpoint #1 did not return")
+	}
+	if got := committedOf(t, repo, 0); got != 100 {
+		t.Fatalf("committed[0] after stale checkpoint = %d, want 100", got)
+	}
+}
+
 func TestCheckpoint_RunTicksAtInterval(t *testing.T) {
 	repo := newFakeSegmentRepo()
 	checkpointPlan(t, repo)

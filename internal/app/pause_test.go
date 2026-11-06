@@ -1,11 +1,13 @@
-// Pause/Resume tests (Phase 7, U3).
+// Pause/Resume tests (Phase 7, U3) for the service WITHOUT the
+// manager wired in (the pre-Phase-4 path).
 //
 // Semantics under test (decided in the fixes plan): Pause cancels the
 // worker context, waits for the worker to exit, keeps the .part file,
 // and parks the job in paused. Resume re-queues the job from the
-// beginning — Stage 1 has no HTTP Range resume, so the next worker
-// starts a fresh single-stream transfer (the engine truncates the
-// preserved .part with O_TRUNC).
+// beginning — with no manager, the next worker starts a fresh
+// single-stream transfer (the engine truncates the preserved .part
+// with O_TRUNC). Real resume through the manager is covered by
+// resume_test.go (Stage 3, Phase 4.1).
 package app
 
 import (
