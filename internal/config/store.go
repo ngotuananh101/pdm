@@ -1,11 +1,15 @@
-// Persisted user settings (Phase 7, U1).
+// Persisted user settings as a JSON file (Stage 1, Phase 7 U1).
 //
-// Stage 1 has no SQLite yet (that is Stage 2), so settings are stored
-// as JSON in <AppDataDir>/settings.json. The file holds the full
-// Config: the UI only edits three fields (download dir, conflict
-// policy, max active downloads) and must never clobber the rest, so
-// Load merges the file over the supplied fallback instead of
-// zero-filling absent fields.
+// Stage 2 (Phase 3) moved the live settings store to SQLite
+// (internal/storage/sqlite SettingsRepository: the whole Config as one
+// JSON value under the "config" key). This file is NOT deleted:
+// config.Load is still the input of the one-time migration
+// (sqlite.MigrateSettingsFromJSON reads the JSON file, writes it to
+// SQLite, then removes the file), and store_test.go still covers
+// Load/Save. No production path writes JSON any more: cmd/pdm loads
+// from SQLite and internal/ui saves through config.SettingsStore.
+// config.Save is retained for the tests and for one-off tooling; it is
+// no longer called by the app.
 //
 // Load never fails hard: a missing, unreadable, or invalid file
 // returns the fallback config plus an error, so a corrupt settings

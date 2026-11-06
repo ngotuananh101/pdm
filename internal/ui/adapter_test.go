@@ -1,11 +1,14 @@
-// Adapter settings-persistence tests (Phase 7, U1).
+// Adapter settings-persistence tests (Phase 7, U1; store switched to
+// SQLite in Stage 2, Phase 3).
 //
-// SaveConfig must write the full current config to disk — editing
-// only the three UI-owned fields — so settings the UI does not own
-// survive a save, and a later Load returns exactly what was saved.
+// SaveConfig must write the full current config through the injected
+// settings store — editing only the three UI-owned fields — so
+// settings the UI does not own survive a save, and a later GetSettings
+// returns exactly what was saved.
 package ui
 
 import (
+	"context"
 	"reflect"
 	"testing"
 	"time"
@@ -13,6 +16,29 @@ import (
 	"github.com/ngotuananh101/pdm/internal/app"
 	"github.com/ngotuananh101/pdm/internal/config"
 )
+
+// fakeSettingsStore is an in-memory config.SettingsStore for adapter
+// tests: it records what SaveConfig persisted without touching disk
+// or SQL (the SQLite behaviour itself is covered in
+// internal/storage/sqlite).
+type fakeSettingsStore struct {
+	saved *config.Config
+}
+
+func (f *fakeSettingsStore) GetSettings(_ context.Context, fallback config.Config) (config.Config, error) {
+	if f.saved != nil {
+		return *f.saved, nil
+	}
+	return fallback, nil
+}
+
+func (f *fakeSettingsStore) SaveSettings(_ context.Context, cfg config.Config) error {
+	c := cfg
+	f.saved = &c
+	return nil
+}
+
+var _ config.SettingsStore = (*fakeSettingsStore)(nil)
 
 func TestAdapterSaveConfigPersistsAndPreservesOtherFields(t *testing.T) {
 	cfg := config.Default(t.TempDir())
@@ -25,8 +51,8 @@ func TestAdapterSaveConfigPersistsAndPreservesOtherFields(t *testing.T) {
 
 	svc := app.NewService(cfg, nil)
 	ad := NewAppServiceAdapter(svc)
-	dir := t.TempDir()
-	ad.settingsDir = dir
+	store := &fakeSettingsStore{}
+	ad.SetSettingsStore(store)
 
 	if err := ad.SaveConfig(ScratchConfig{
 		DefaultDownloadDir: "/tmp/elsewhere",
@@ -40,12 +66,11 @@ func TestAdapterSaveConfigPersistsAndPreservesOtherFields(t *testing.T) {
 	want.DefaultDownloadDir = "/tmp/elsewhere"
 	want.FileConflictPolicy = config.ConflictAutoRename
 	want.MaxActiveDownloads = 7
-	got, err := config.Load(dir, config.Default("/fallback"))
-	if err != nil {
-		t.Fatalf("Load = %v", err)
+	if store.saved == nil {
+		t.Fatal("SaveConfig did not persist anything through the settings store")
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("persisted config = %+v, want %+v", got, want)
+	if !reflect.DeepEqual(*store.saved, want) {
+		t.Fatalf("persisted config = %+v, want %+v", *store.saved, want)
 	}
 
 	// In-memory config agrees with what was persisted.
@@ -59,7 +84,8 @@ func TestAdapterSaveConfigInvalidReturnsError(t *testing.T) {
 	cfg := config.Default(t.TempDir())
 	svc := app.NewService(cfg, nil)
 	ad := NewAppServiceAdapter(svc)
-	ad.settingsDir = t.TempDir()
+	store := &fakeSettingsStore{}
+	ad.SetSettingsStore(store)
 
 	if err := ad.SaveConfig(ScratchConfig{
 		DefaultDownloadDir: "/tmp/elsewhere",
@@ -69,7 +95,22 @@ func TestAdapterSaveConfigInvalidReturnsError(t *testing.T) {
 		t.Fatal("SaveConfig with MaxActiveDownloads 0 should return an error")
 	}
 	// Nothing was persisted for the rejected save.
-	if _, err := config.Load(ad.settingsDir, cfg); err == nil {
-		t.Fatal("Load should fail: no settings file must exist after a rejected save")
+	if store.saved != nil {
+		t.Fatalf("invalid SaveConfig persisted %+v, want nothing persisted", *store.saved)
+	}
+}
+
+func TestAdapterSaveConfigWithoutStoreReturnsError(t *testing.T) {
+	cfg := config.Default(t.TempDir())
+	svc := app.NewService(cfg, nil)
+	ad := NewAppServiceAdapter(svc)
+	// No SetSettingsStore call: SaveConfig must fail loudly instead
+	// of silently writing settings the next startup would ignore.
+	if err := ad.SaveConfig(ScratchConfig{
+		DefaultDownloadDir: "/tmp/elsewhere",
+		ConflictPolicy:     ConflictAsk,
+		MaxActiveDownloads: 3,
+	}); err == nil {
+		t.Fatal("SaveConfig without a settings store should return an error")
 	}
 }

@@ -3,12 +3,12 @@ package ui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 
 	"github.com/ngotuananh101/pdm/internal/app"
 	"github.com/ngotuananh101/pdm/internal/config"
 	"github.com/ngotuananh101/pdm/internal/domain"
-	"github.com/ngotuananh101/pdm/internal/platform"
 )
 
 // AppServiceAdapter adapts the real app.Service (which speaks
@@ -19,9 +19,11 @@ import (
 type AppServiceAdapter struct {
 	svc    *app.Service
 	logger *slog.Logger
-	// settingsDir overrides the directory settings are persisted
-	// to (platform.AppDataDir by default). Tests set it directly.
-	settingsDir string
+	// settingsStore persists the full config (SQLite, Stage 2 Phase
+	// 3). cmd/pdm injects it via SetSettingsStore; the adapter never
+	// touches SQL itself (ARCH §3: only cmd/pdm composes concrete
+	// implementations).
+	settingsStore config.SettingsStore
 }
 
 // NewAppServiceAdapter wraps a real app.Service for the UI.
@@ -35,6 +37,14 @@ func NewAppServiceAdapterWithLogger(svc *app.Service, logger *slog.Logger) *AppS
 		logger = slog.Default()
 	}
 	return &AppServiceAdapter{svc: svc, logger: logger}
+}
+
+// SetSettingsStore injects the store SaveConfig persists through.
+// cmd/pdm supplies the SQLite settings repository; without one,
+// SaveConfig returns an error instead of silently writing settings
+// the next startup would ignore.
+func (a *AppServiceAdapter) SetSettingsStore(store config.SettingsStore) {
+	a.settingsStore = store
 }
 
 func mapPolicy(p config.FileConflictPolicy) ConflictPolicy {
@@ -208,20 +218,10 @@ func (a *AppServiceAdapter) SaveConfig(sc ScratchConfig) error {
 	// not own. The in-memory config is already updated above; a
 	// disk failure is reported instead of silently pretending the
 	// settings will survive a restart.
-	dir, err := a.settingsDirForSave()
-	if err != nil {
-		return err
+	if a.settingsStore == nil {
+		return fmt.Errorf("ui: no settings store configured, settings not persisted")
 	}
-	return config.Save(dir, cur)
-}
-
-// settingsDirForSave returns the directory settings are persisted
-// to: the test override when set, platform.AppDataDir otherwise.
-func (a *AppServiceAdapter) settingsDirForSave() (string, error) {
-	if a.settingsDir != "" {
-		return a.settingsDir, nil
-	}
-	return platform.AppDataDir()
+	return a.settingsStore.SaveSettings(context.Background(), cur)
 }
 
 func (a *AppServiceAdapter) SetListener(f func()) {

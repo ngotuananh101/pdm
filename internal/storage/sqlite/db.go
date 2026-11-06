@@ -19,6 +19,12 @@ import (
 // should be rare; the timeout is a safety net, not the primary mechanism.
 const BusyTimeoutMillis = 5000
 
+// DefaultDBFilename is the SQLite database file name inside the app
+// data directory ("pdm.db"); cmd/pdm opens
+// filepath.Join(appDataDir, DefaultDBFilename). Tests use the same name
+// for temporary databases.
+const DefaultDBFilename = "pdm.db"
+
 // DB is an opened PDM SQLite database, ready to use: migrations have run
 // and the pragmas from ARCH §9 are in effect. It embeds *sql.DB, so the
 // usual Query/Exec methods are available; Close releases the file.
