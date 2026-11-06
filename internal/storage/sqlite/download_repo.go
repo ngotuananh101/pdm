@@ -33,6 +33,17 @@ func NewDownloadRepository(db *sql.DB) *DownloadRepository {
 	return &DownloadRepository{db: db}
 }
 
+// Close closes the underlying database connection. The repository
+// shares the *sql.DB with the settings repository (same handle opened
+// by Open), so Close must only be called at shutdown, when no further
+// settings or download writes will happen.
+func (r *DownloadRepository) Close() error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	return r.db.Close()
+}
+
 var _ domain.DownloadRepository = (*DownloadRepository)(nil)
 
 // downloadColumns is the persisted-field column list, in scan order.

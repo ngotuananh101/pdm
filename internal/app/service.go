@@ -88,19 +88,40 @@ type Service struct {
 	mu         sync.RWMutex
 	cfg        config.Config
 	downloader domain.StreamDownloader
-	jobs       map[string]*job
-	order      []string
-	listener   func()
-	closed     bool
-	sched      *scheduler.Scheduler
+	// repo persists every status change (Phase 5.1). A nil repo
+	// means the service runs RAM-only, exactly like Stage 1.
+	repo     domain.DownloadRepository
+	jobs     map[string]*job
+	order    []string
+	listener func()
+	closed   bool
+	// shutdownComplete reports that a Shutdown call ran to
+	// completion (workers done, checkpoint synced, DB closed). A
+	// later Shutdown returns nil immediately.
+	shutdownComplete bool
+	// restored reports that LoadFromRepository already ran; a
+	// second call is a no-op.
+	restored bool
+	sched    *scheduler.Scheduler
 }
 
-// NewService creates a Service with the given config and downloader.
+// NewService creates a Service with the given config and downloader,
+// without persistence (repo is nil). See NewServiceWithRepository.
 // If downloader is nil, a SingleDownloader bound to cfg is used.
 // MaxActiveDownloads and FileConflictPolicy are normalized so a
 // zero-valued config still yields a usable service; other zero
 // fields are left as-is (the engine treats them as defaults).
 func NewService(cfg config.Config, downloader domain.StreamDownloader) *Service {
+	return NewServiceWithRepository(cfg, downloader, nil)
+}
+
+// NewServiceWithRepository creates a Service that persists every
+// status change through repo (see setStatusLocked). A nil repo means
+// the service runs RAM-only, exactly like NewService. Prefer this
+// constructor when the repository is known at construction; use
+// SetDownloadRepository when it only becomes available later
+// (cmd/pdm opens the database conditionally).
+func NewServiceWithRepository(cfg config.Config, downloader domain.StreamDownloader, repo domain.DownloadRepository) *Service {
 	if cfg.MaxActiveDownloads <= 0 {
 		cfg.MaxActiveDownloads = config.DefaultMaxActiveDownloads
 	}
@@ -116,6 +137,7 @@ func NewService(cfg config.Config, downloader domain.StreamDownloader) *Service 
 	svc := &Service{
 		cfg:        cfg,
 		downloader: downloader,
+		repo:       repo,
 		jobs:       make(map[string]*job),
 	}
 	// The scheduler owns the pending queue and the slot limits; the
@@ -124,6 +146,16 @@ func NewService(cfg config.Config, downloader domain.StreamDownloader) *Service 
 	// matching the old maxConnsPerHostLocked behaviour.
 	svc.sched = scheduler.New(cfg.MaxActiveDownloads, cfg.MaxConnectionsPerHost, svc.startJob)
 	return svc
+}
+
+// SetDownloadRepository attaches (or replaces) the persistence
+// repository. Jobs already in RAM keep working: their next status
+// change inserts the missing row instead of failing (see
+// persistLocked). It is safe to call with nil to detach persistence.
+func (s *Service) SetDownloadRepository(repo domain.DownloadRepository) {
+	s.mu.Lock()
+	s.repo = repo
+	s.mu.Unlock()
 }
 
 // New is an alias for NewService.
@@ -178,18 +210,49 @@ func (s *Service) SetListener(f func()) {
 	s.mu.Unlock()
 }
 
-// setStatusLocked is the single gate for every status change: it moves
-// j to the given status only when domain.CanTransition allows it, and
-// returns an error wrapping domain.ErrInvalidTransition otherwise,
-// leaving the status unchanged. Caller must hold s.mu. Direct
-// assignments to download.Status outside this helper are forbidden.
+// setStatusLocked is the single gate for every live status change: it
+// moves j to the given status only when domain.CanTransition allows
+// it, and returns an error wrapping domain.ErrInvalidTransition
+// otherwise, leaving the status unchanged. On success it also writes
+// the job's full persisted state to the repository, so the DB always
+// reflects the status the service reports; a DB failure restores the
+// job exactly (status and fields) and returns an error instead of
+// reporting false success. Caller must hold s.mu. Direct assignments
+// to download.Status outside this helper are forbidden, except
+// restart recovery in lifecycle.go, which is not a live transition
+// (no worker ever ran in this process).
 func (s *Service) setStatusLocked(j *job, to domain.Status) error {
 	from := j.download.Status
 	if !domain.CanTransition(from, to) {
 		return fmt.Errorf("%w: cannot move job %q from %q to %q", domain.ErrInvalidTransition, j.download.ID, from, to)
 	}
+	// Snapshot the whole entity: a failed DB write restores the job
+	// exactly, including fields the caller reset before this call
+	// (Retry/Resume clear error state first).
+	prev := j.download
 	j.download.Status = to
 	j.download.UpdatedAt = time.Now().UTC()
+	if err := s.persistLocked(j); err != nil {
+		j.download = prev
+		return fmt.Errorf("app: persist status %q for job %q: %w", to, j.download.ID, err)
+	}
+	return nil
+}
+
+// persistLocked writes j's full persisted state to the repository.
+// Caller must hold s.mu. A nil repo is a no-op: the service runs
+// RAM-only. When the row does not exist yet (the job predates the
+// attached repo), the row is inserted instead of failing.
+func (s *Service) persistLocked(j *job) error {
+	if s.repo == nil {
+		return nil
+	}
+	if err := s.repo.Update(context.Background(), &j.download); err != nil {
+		if errors.Is(err, domain.ErrDownloadNotFound) {
+			return s.repo.Insert(context.Background(), &j.download)
+		}
+		return err
+	}
 	return nil
 }
 
@@ -333,6 +396,12 @@ func (s *Service) AddDownload(req AddRequest) (string, error) {
 		s.mu.Unlock()
 		return "", domain.ErrServiceClosed
 	}
+	if s.repo != nil {
+		if err := s.repo.Insert(context.Background(), &j.download); err != nil {
+			s.mu.Unlock()
+			return "", fmt.Errorf("app: persist new download: %w", err)
+		}
+	}
 	s.jobs[id] = j
 	s.order = append(s.order, id)
 	// Enqueue while still holding mu: the dispatch inside runs
@@ -434,6 +503,12 @@ func (s *Service) Cancel(id string, deleteTemp bool) error {
 		// cancel it. There is no worker goroutine to wait for.
 		s.sched.Stop(id)
 		if err := s.setStatusLocked(j, domain.StatusCancelled); err != nil {
+			// The job was removed from the scheduler's pending
+			// queue above; put it back so a DB failure does not
+			// leave it queued in RAM but undispatchable.
+			if j.download.Status == domain.StatusQueued {
+				s.sched.Enqueue(id, hostOf(j.download.URL))
+			}
 			s.mu.Unlock()
 			return err
 		}
@@ -537,7 +612,10 @@ func (s *Service) Cancel(id string, deleteTemp bool) error {
 		if err := s.setStatusLocked(j, domain.StatusCancelled); err != nil {
 			s.mu.Unlock()
 			s.notify()
-			return nil
+			if errors.Is(err, domain.ErrInvalidTransition) {
+				return nil
+			}
+			return err
 		}
 	}
 	j.download.SpeedBytesPerSec = 0
@@ -646,6 +724,12 @@ func (s *Service) Pause(id string) error {
 		// nothing to wait for.
 		s.sched.Stop(id)
 		if err := s.setStatusLocked(j, domain.StatusPaused); err != nil {
+			// The job was removed from the scheduler's pending
+			// queue above; put it back so a DB failure does not
+			// leave it queued in RAM but undispatchable.
+			if j.download.Status == domain.StatusQueued {
+				s.sched.Enqueue(id, hostOf(j.download.URL))
+			}
 			s.mu.Unlock()
 			return err
 		}
@@ -705,7 +789,10 @@ func (s *Service) Pause(id string) error {
 	if err := s.setStatusLocked(j, domain.StatusPaused); err != nil {
 		s.mu.Unlock()
 		s.notify()
-		return nil
+		if errors.Is(err, domain.ErrInvalidTransition) {
+			return nil
+		}
+		return err
 	}
 	j.download.SpeedBytesPerSec = 0
 	j.download.ETASeconds = -1
@@ -786,6 +873,17 @@ func (s *Service) Remove(id string) error {
 	// (Active/paused jobs are refused above, so there is no worker
 	// to wait for here.)
 	s.sched.Stop(id)
+	if s.repo != nil {
+		if err := s.repo.Delete(context.Background(), id); err != nil && !errors.Is(err, domain.ErrDownloadNotFound) {
+			// The row stays, so the record must stay too; put a
+			// queued job back in the scheduler's pending queue.
+			if j.download.Status == domain.StatusQueued {
+				s.sched.Enqueue(id, hostOf(j.download.URL))
+			}
+			s.mu.Unlock()
+			return err
+		}
+	}
 	delete(s.jobs, id)
 	_ = s.order
 	for i, oid := range s.order {

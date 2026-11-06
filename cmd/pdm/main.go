@@ -34,12 +34,18 @@ func main() {
 	// stored settings all fall back to defaults with a warning, so
 	// bad settings can never prevent startup. The JSON file is only
 	// read by the one-time migration, never as the live store.
+	//
+	// db is kept in scope past this block: the same open database
+	// also backs the download repository below (Phase 5) — one
+	// shared connection, never opened twice.
 	var settingsStore config.SettingsStore
+	var db *sqlite.DB
 	if dir, err := platform.AppDataDir(); err != nil {
 		logger.Warn("pdm: cannot locate app data dir, using default settings", "err", err)
-	} else if db, err := sqlite.Open(filepath.Join(dir, sqlite.DefaultDBFilename)); err != nil {
+	} else if opened, err := sqlite.Open(filepath.Join(dir, sqlite.DefaultDBFilename)); err != nil {
 		logger.Warn("pdm: cannot open database, using default settings", "err", err)
 	} else {
+		db = opened
 		defer db.Close()
 		ctx := context.Background()
 		if migrated, err := sqlite.MigrateSettingsFromJSON(ctx, db.DB, dir, cfg); err != nil {
@@ -58,6 +64,17 @@ func main() {
 	httpClient := engine.NewHTTPClient(cfg)
 	downloader := engine.NewSingleDownloader(cfg, httpClient)
 	coreSvc := app.NewService(cfg, downloader)
+	if db != nil {
+		// The download repository wraps the same *sql.DB the
+		// settings repository uses; Service.Shutdown closes it
+		// after the shutdown checkpoint. A failed restore must
+		// never prevent startup: the app continues with an empty
+		// queue and the next startup retries recovery.
+		coreSvc.SetDownloadRepository(sqlite.NewDownloadRepository(db.DB))
+		if err := coreSvc.LoadFromRepository(context.Background()); err != nil {
+			logger.Warn("pdm: could not restore previous downloads", "err", err)
+		}
+	}
 	svc := ui.NewAppServiceAdapterWithLogger(coreSvc, logger)
 	// The settings dialog saves through the SQLite store; without a
 	// database (open failed above) SaveConfig reports an error
