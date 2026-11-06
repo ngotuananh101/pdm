@@ -18,6 +18,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 	}
+	// Stop the scheduler as well: no further job may dispatch,
+	// and its running entries are cancelled (cancelling twice —
+	// here via j.cancel and there via the entry — is harmless).
+	s.sched.Close()
 	// Collect done channels of running jobs while holding the lock.
 	var dones []chan struct{}
 	for _, j := range s.jobs {

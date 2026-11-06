@@ -1,6 +1,10 @@
-// Package app owns Stage 1 download state: the job queue, the
-// concurrency scheduler, per-job worker lifecycle, speed/ETA
-// calculation, and listener notifications.
+// Package app owns Stage 1 download state: the job queue, per-job
+// worker lifecycle, speed/ETA calculation, and listener notifications.
+//
+// The concurrency scheduler lives in internal/scheduler: it owns the
+// pending queue, the global slot limit, and the per-host slot limit,
+// and the service feeds it jobs through startJob. Status changes
+// still go through the single setStatusLocked gate below.
 //
 // Concurrency discipline (critical):
 //   - All mutable state is guarded by Service.mu (sync.RWMutex).
@@ -12,6 +16,11 @@
 //     exited (the engine closes all file handles before returning),
 //     which makes it safe to delete a .part file after <-done,
 //     even on Windows.
+//   - Scheduler calls (Enqueue, SetLimits, Finished) are made while
+//     holding mu, because the scheduler invokes startJob
+//     synchronously and startJob assumes mu is held (see startJob).
+//     The scheduler never calls startJob while holding its own
+//     lock, so this cannot deadlock.
 package app
 
 import (
@@ -30,6 +39,7 @@ import (
 	"github.com/ngotuananh101/pdm/internal/domain"
 	"github.com/ngotuananh101/pdm/internal/engine"
 	"github.com/ngotuananh101/pdm/internal/platform"
+	"github.com/ngotuananh101/pdm/internal/scheduler"
 )
 
 // AddRequest describes a new download to enqueue.
@@ -71,7 +81,9 @@ type job struct {
 	lastTime  time.Time
 }
 
-// Service is the Stage 1 download service.
+// Service is the Stage 1 download service. Queueing and concurrency
+// limits live in the scheduler (see NewService); the service keeps
+// the job records, the status machine, and the worker lifecycle.
 type Service struct {
 	mu         sync.RWMutex
 	cfg        config.Config
@@ -80,9 +92,7 @@ type Service struct {
 	order      []string
 	listener   func()
 	closed     bool
-	running    int
-	// hostRunning counts running jobs per host (A5, Phase 6).
-	hostRunning map[string]int
+	sched      *scheduler.Scheduler
 }
 
 // NewService creates a Service with the given config and downloader.
@@ -103,17 +113,51 @@ func NewService(cfg config.Config, downloader domain.StreamDownloader) *Service 
 	if downloader == nil {
 		downloader = engine.NewSingleDownloader(cfg, nil)
 	}
-	return &Service{
-		cfg:         cfg,
-		downloader:  downloader,
-		jobs:        make(map[string]*job),
-		hostRunning: make(map[string]int),
+	svc := &Service{
+		cfg:        cfg,
+		downloader: downloader,
+		jobs:       make(map[string]*job),
 	}
+	// The scheduler owns the pending queue and the slot limits; the
+	// service feeds it jobs through startJob. A zero
+	// MaxConnectionsPerHost falls back to the scheduler default (4),
+	// matching the old maxConnsPerHostLocked behaviour.
+	svc.sched = scheduler.New(cfg.MaxActiveDownloads, cfg.MaxConnectionsPerHost, svc.startJob)
+	return svc
 }
 
 // New is an alias for NewService.
 func New(cfg config.Config, downloader domain.StreamDownloader) *Service {
 	return NewService(cfg, downloader)
+}
+
+// startJob is the scheduler's dispatch callback: it performs the
+// queued -> probing transition, installs the worker's cancel/done,
+// and spawns run().
+//
+// It is invoked synchronously from Scheduler.Enqueue/SetLimits/
+// Finished, outside the scheduler lock — and always while the
+// caller holds s.mu, so it must NOT take s.mu itself. Returning
+// false tells the scheduler the job could not start (paused,
+// cancelled, or removed meanwhile) so the reserved slot is released
+// and the next job is dispatched.
+func (s *Service) startJob(id string, ctx context.Context, cancel context.CancelFunc, done chan struct{}) bool {
+	j, ok := s.jobs[id]
+	if !ok || j.running {
+		return false
+	}
+	// queued -> probing is always allowed for the job selected
+	// above; if it ever fails, refuse the dispatch and leave the
+	// job queued for the next dispatch attempt.
+	if err := s.setStatusLocked(j, domain.StatusProbing); err != nil {
+		return false
+	}
+	j.cancel = cancel
+	j.done = done
+	j.cancelling = false
+	j.running = true
+	go s.run(id, ctx, done)
+	return true
 }
 
 // notify invokes the listener without holding mu. The listener is
@@ -164,7 +208,10 @@ func (s *Service) UpdateConfig(cfg config.Config) error {
 	}
 	s.mu.Lock()
 	s.cfg = cfg
-	s.tryDispatchLocked()
+	// Update the scheduler limits while still holding mu: the
+	// dispatch inside SetLimits runs startJob, which assumes mu
+	// is held.
+	s.sched.SetLimits(cfg.MaxActiveDownloads, cfg.MaxConnectionsPerHost)
 	s.mu.Unlock()
 	s.notify()
 	return nil
@@ -288,7 +335,9 @@ func (s *Service) AddDownload(req AddRequest) (string, error) {
 	}
 	s.jobs[id] = j
 	s.order = append(s.order, id)
-	s.tryDispatchLocked()
+	// Enqueue while still holding mu: the dispatch inside runs
+	// startJob, which assumes mu is held.
+	s.sched.Enqueue(id, hostOf(req.URL))
 	s.mu.Unlock()
 	s.notify()
 	return id, nil
@@ -380,8 +429,10 @@ func (s *Service) Cancel(id string, deleteTemp bool) error {
 		return fmt.Errorf("%w: cannot cancel job in status %q", domain.ErrInvalidTransition, st)
 	}
 	if !j.running {
-		// Queued but not yet dispatched: no worker goroutine exists,
-		// so there is nothing to wait for.
+		// Queued but not yet dispatched: remove it from the
+		// scheduler's pending queue so it can never start, then
+		// cancel it. There is no worker goroutine to wait for.
+		s.sched.Stop(id)
 		if err := s.setStatusLocked(j, domain.StatusCancelled); err != nil {
 			s.mu.Unlock()
 			return err
@@ -411,13 +462,15 @@ func (s *Service) Cancel(id string, deleteTemp bool) error {
 		return nil
 	}
 	j.cancelling = true
-	cancel := j.cancel
 	done := j.done
 	s.mu.Unlock()
 
-	if cancel != nil {
-		cancel()
-	}
+	// Cancel the worker through the scheduler: this serializes
+	// with a concurrent Pause/Cancel for the same job and marks
+	// the entry stopping so no new worker can start for it. The
+	// done channel is closed by run()'s defer once the worker has
+	// fully exited, even if the scheduler entry is already gone.
+	s.sched.Stop(id)
 	if done != nil {
 		<-done
 	}
@@ -533,7 +586,9 @@ func (s *Service) Retry(id string) error {
 	j.running = false
 	j.lastBytes = 0
 	j.lastTime = time.Time{}
-	s.tryDispatchLocked()
+	// Re-queue while still holding mu: the dispatch inside runs
+	// startJob, which assumes mu is held.
+	s.sched.Enqueue(id, hostOf(j.download.URL))
 	s.mu.Unlock()
 	s.notify()
 	return nil
@@ -585,8 +640,11 @@ func (s *Service) Pause(id string) error {
 		return fmt.Errorf("%w: cannot pause job in status %q", domain.ErrInvalidTransition, st)
 	}
 	if !j.running {
-		// Queued but not yet dispatched: no worker goroutine
-		// exists, so there is nothing to wait for.
+		// Queued but not yet dispatched: remove it from the
+		// scheduler's pending queue so it can never start, then
+		// park it. No worker goroutine exists, so there is
+		// nothing to wait for.
+		s.sched.Stop(id)
 		if err := s.setStatusLocked(j, domain.StatusPaused); err != nil {
 			s.mu.Unlock()
 			return err
@@ -599,13 +657,14 @@ func (s *Service) Pause(id string) error {
 		return nil
 	}
 	j.pausing = true
-	cancel := j.cancel
 	done := j.done
 	s.mu.Unlock()
 
-	if cancel != nil {
-		cancel()
-	}
+	// Stop the worker through the scheduler (see Cancel): it
+	// cancels the context, serializes with a concurrent
+	// Pause/Cancel for the same job, and marks the entry
+	// stopping so no new worker can start for it.
+	s.sched.Stop(id)
 	if done != nil {
 		<-done
 	}
@@ -695,7 +754,9 @@ func (s *Service) Resume(id string) error {
 	j.running = false
 	j.lastBytes = 0
 	j.lastTime = time.Time{}
-	s.tryDispatchLocked()
+	// Re-queue while still holding mu: the dispatch inside runs
+	// startJob, which assumes mu is held.
+	s.sched.Enqueue(id, hostOf(j.download.URL))
 	s.mu.Unlock()
 	s.notify()
 	return nil
@@ -720,6 +781,11 @@ func (s *Service) Remove(id string) error {
 	}
 	idCopy := id
 	_ = idCopy
+	// A queued job may still sit in the scheduler's pending queue;
+	// remove it so it can never start after its record is gone.
+	// (Active/paused jobs are refused above, so there is no worker
+	// to wait for here.)
+	s.sched.Stop(id)
 	delete(s.jobs, id)
 	_ = s.order
 	for i, oid := range s.order {
@@ -926,68 +992,6 @@ func hostOf(rawURL string) string {
 	return strings.ToLower(u.Hostname())
 }
 
-// maxConnsPerHostLocked returns the effective per-host slot limit:
-// the configured value, or the default when unset.
-func (s *Service) maxConnsPerHostLocked() int {
-	if s.cfg.MaxConnectionsPerHost <= 0 {
-		return config.DefaultMaxConnectionsPerHost
-	}
-	return s.cfg.MaxConnectionsPerHost
-}
-
-// tryDispatchLocked starts queued jobs while slots are available.
-// Caller must hold s.mu.
-//
-// A job is dispatched only when both a global slot
-// (MaxActiveDownloads) and a per-host slot (MaxConnectionsPerHost,
-// A5) are free. The scan skips queued jobs whose host is full and
-// dispatches a later job for another host instead of head-of-line
-// blocking behind a capped host; a job whose host is full simply
-// stays queued until a slot for that host frees up.
-func (s *Service) tryDispatchLocked() {
-	if s.closed {
-		return
-	}
-	for s.running < s.cfg.MaxActiveDownloads {
-		var next *job
-		var nextHost string
-		for _, id := range s.order {
-			j := s.jobs[id]
-			if j == nil || j.download.Status != domain.StatusQueued || j.running {
-				continue
-			}
-			h := hostOf(j.download.URL)
-			if h != "" && s.hostRunning[h] >= s.maxConnsPerHostLocked() {
-				continue
-			}
-			next = j
-			nextHost = h
-			break
-		}
-		if next == nil {
-			return
-		}
-		// queued -> probing is always allowed for the job selected
-		// above; if it ever fails, stop dispatching and leave the
-		// job queued for the next dispatch attempt.
-		if err := s.setStatusLocked(next, domain.StatusProbing); err != nil {
-			return
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan struct{})
-		next.cancel = cancel
-		next.done = done
-		next.cancelling = false
-		next.running = true
-		s.running++
-		if nextHost != "" {
-			s.hostRunning[nextHost]++
-		}
-		id := next.download.ID
-		go s.run(id, ctx, done)
-	}
-}
-
 // onProgress updates byte counts and EWMA speed (alpha=0.3).
 func (s *Service) onProgress(id string, pu domain.ProgressUpdate) {
 	s.mu.Lock()
@@ -1033,24 +1037,32 @@ func (s *Service) onProgress(id string, pu domain.ProgressUpdate) {
 // run executes one job. done is closed (via defer) only after the
 // engine has returned and all file handles are closed.
 func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
-	host := ""
 	defer func() {
 		s.mu.Lock()
-		if s.running > 0 {
-			s.running--
-		}
-		// Release this generation's per-host slot (A5). host is
-		// captured when the run started, so the slot is released
-		// even if the job record was removed meanwhile. A Retry
-		// that started a new generation counts its own slot
-		// separately, so one decrement per run is exact.
-		if host != "" && s.hostRunning[host] > 0 {
-			s.hostRunning[host]--
-		}
 		if jj, ok := s.jobs[id]; ok && jj.done == done {
 			jj.running = false
 		}
-		s.tryDispatchLocked()
+		// Report the worker exit to the scheduler while still
+		// holding mu: the dispatch inside Finished runs startJob,
+		// which assumes mu is held, so a Retry/Resume cannot slip
+		// in between the slot release and the dispatch and leave
+		// the job stuck queued. Finished ignores a stale
+		// generation (done does not match the running entry), so
+		// one release per run is exact even if a Retry started a
+		// new generation meanwhile.
+		s.sched.Finished(id, done)
+		// A Retry/Resume may have slipped in between run()
+		// recording the final status and this defer: it set the
+		// job queued, but its Enqueue was refused because the
+		// scheduler entry still existed. The entry is gone now,
+		// so enqueue the job again — otherwise it would sit
+		// queued forever with no worker. (The entry is gone, so
+		// this cannot start a second worker for the old
+		// generation; a Cancel/Pause of the new generation that
+		// ran meanwhile has already moved it out of queued.)
+		if jj, ok := s.jobs[id]; ok && jj.download.Status == domain.StatusQueued && !jj.running {
+			s.sched.Enqueue(id, hostOf(jj.download.URL))
+		}
 		s.mu.Unlock()
 		close(done)
 		s.notify()
@@ -1062,7 +1074,6 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 		s.mu.Unlock()
 		return
 	}
-	host = hostOf(j.download.URL)
 	if j.cancelling {
 		if err := s.setStatusLocked(j, domain.StatusCancelled); err != nil {
 			// Unreachable: probing -> cancelled is always allowed
