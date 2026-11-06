@@ -129,15 +129,20 @@ const (
 // It is owned by the app/engine layer; the UI only ever receives
 // DownloadSnapshot copies.
 type Download struct {
-	ID                string
-	URL               string
-	Filename          string
-	DestinationDir    string
-	TempPath          string
-	FinalPath         string
-	Status            Status
-	TotalBytes        int64 // -1 if unknown
-	DownloadedBytes   int64
+	ID              string
+	URL             string
+	Filename        string
+	DestinationDir  string
+	TempPath        string
+	FinalPath       string
+	Status          Status
+	TotalBytes      int64 // -1 if unknown
+	DownloadedBytes int64
+	// Resource validators from the probe (ARCH §5). Empty / false until
+	// Stage 3 sets real values; they are plain data, no behavior.
+	ETag              string
+	LastModified      string
+	SupportsRange     bool
 	SpeedBytesPerSec  float64
 	ETASeconds        int64 // -1 if unknown
 	ErrorCode         ErrorCode
@@ -161,6 +166,9 @@ type DownloadSnapshot struct {
 	Status            Status
 	TotalBytes        int64 // -1 if unknown
 	DownloadedBytes   int64
+	ETag              string
+	LastModified      string
+	SupportsRange     bool
 	SpeedBytesPerSec  float64
 	ETASeconds        int64 // -1 if unknown
 	ErrorCode         ErrorCode
@@ -187,6 +195,9 @@ func (d *Download) Snapshot() DownloadSnapshot {
 		Status:            d.Status,
 		TotalBytes:        d.TotalBytes,
 		DownloadedBytes:   d.DownloadedBytes,
+		ETag:              d.ETag,
+		LastModified:      d.LastModified,
+		SupportsRange:     d.SupportsRange,
 		SpeedBytesPerSec:  d.SpeedBytesPerSec,
 		ETASeconds:        d.ETASeconds,
 		ErrorCode:         d.ErrorCode,
