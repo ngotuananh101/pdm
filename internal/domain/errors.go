@@ -39,8 +39,13 @@ var (
 	ErrSymlinkTarget      = errors.New("destination resolves through a symlink")
 	ErrInvalidTransition  = errors.New("invalid status transition")
 	ErrDownloadNotFound   = errors.New("download not found")
-	ErrSizeMismatch       = errors.New("downloaded size does not match expected size")
-	ErrServiceClosed      = errors.New("service is closed")
+	ErrSegmentNotFound    = errors.New("segment not found")
+	// ErrCommittedBytesRegression reports an attempt to move a
+	// segment's committed_bytes backwards; committed progress never
+	// regresses.
+	ErrCommittedBytesRegression = errors.New("committed bytes would regress")
+	ErrSizeMismatch             = errors.New("downloaded size does not match expected size")
+	ErrServiceClosed            = errors.New("service is closed")
 )
 
 // FileConflictError reports that the destination file already exists.

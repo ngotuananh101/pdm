@@ -101,3 +101,36 @@ type DownloadRepository interface {
 	// download to the position it already occupies is a no-op.
 	Move(ctx context.Context, id string, position int) error
 }
+
+// SegmentRepository persists Segment rows for a download job.
+// The app/engine layers depend only on this interface; the SQLite
+// implementation lives in internal/storage/sqlite.
+//
+// Mapping (schema 001, ARCH §5): end_offset is inclusive; status is
+// one of "pending", "running", "complete"; committed_bytes only ever
+// moves forward.
+//
+// Methods that address a missing segment (UpdateCommitted, MarkStatus)
+// return an error wrapping ErrSegmentNotFound. UpdateCommitted with a
+// value below the stored one returns an error wrapping
+// ErrCommittedBytesRegression and leaves the stored value unchanged.
+type SegmentRepository interface {
+	// InsertPlan stores every segment of one job in a single
+	// transaction: either the whole plan lands or none of it does.
+	// Each segment's DownloadID is set to downloadID. Inserting a
+	// plan for a download that does not exist is an error (FK).
+	// An empty plan is an error.
+	InsertPlan(ctx context.Context, downloadID string, segments []Segment) error
+	// GetByDownload returns the segments of one download in index
+	// order. A download with no segments yields an empty slice.
+	GetByDownload(ctx context.Context, downloadID string) ([]*Segment, error)
+	// UpdateCommitted advances the committed_bytes of one segment.
+	// The value must not exceed the segment size and must never go
+	// below the stored value.
+	UpdateCommitted(ctx context.Context, downloadID string, index int, committedBytes int64) error
+	// MarkStatus changes only the status of one segment.
+	MarkStatus(ctx context.Context, downloadID string, index int, status SegmentStatus) error
+	// DeleteByDownload removes every segment of one download.
+	// Deleting segments that do not exist is a no-op, not an error.
+	DeleteByDownload(ctx context.Context, downloadID string) error
+}
