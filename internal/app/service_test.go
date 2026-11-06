@@ -52,18 +52,25 @@ func getJob(s *Service, id string) domain.DownloadSnapshot {
 
 // countingDownloader wraps a real handler-based httptest server and
 // counts requests, used to assert that ResolveConflict does not
-// re-fetch from the server.
+// re-fetch from the server. hits counts every request; downloads
+// counts only full downloads, excluding the probe's ranged GET
+// (Range: bytes=0-0), so assertions about re-downloads are not
+// thrown off by the probe (Stage 3, Phase 2).
 type countingDownloader struct {
-	mu       sync.Mutex
-	hits     int
-	blockCh  chan struct{}
-	blockMax int
+	mu        sync.Mutex
+	hits      int
+	downloads int
+	blockCh   chan struct{}
+	blockMax  int
 }
 
 func (c *countingDownloader) handler(content []byte, cd string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		c.mu.Lock()
 		c.hits++
+		if r.Header.Get("Range") == "" {
+			c.downloads++
+		}
 		hit := c.hits
 		block := c.blockCh != nil && hit <= c.blockMax
 		c.mu.Unlock()
@@ -88,6 +95,14 @@ func (c *countingDownloader) hitCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.hits
+}
+
+// downloadHitCount returns the number of full-download requests,
+// excluding probe requests.
+func (c *countingDownloader) downloadHitCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.downloads
 }
 
 // newRealService builds a Service backed by the real engine against
@@ -302,7 +317,7 @@ func TestMidDownloadContentDispositionConflictResolveConflict(t *testing.T) {
 		t.Fatal("TempPath empty — .part path not recorded")
 	}
 	_ = tempPath
-	hitsBefore := cd.hitCount()
+	hitsBefore := cd.downloadHitCount()
 
 	// ResolveConflict(AutoRename) cannot finalize: no .part exists
 	// (the engine's early check returned before writing one), so
@@ -316,7 +331,7 @@ func TestMidDownloadContentDispositionConflictResolveConflict(t *testing.T) {
 		t.Fatalf("status after ResolveConflict = %q, want failed (must not re-queue)", got)
 	}
 	time.Sleep(200 * time.Millisecond)
-	if got := cd.hitCount(); got != hitsBefore {
+	if got := cd.downloadHitCount(); got != hitsBefore {
 		t.Fatalf("ResolveConflict re-downloaded: hits = %d, want %d", got, hitsBefore)
 	}
 
@@ -330,8 +345,8 @@ func TestMidDownloadContentDispositionConflictResolveConflict(t *testing.T) {
 	if snap.Filename != "cdfile (1).bin" {
 		t.Fatalf("Filename = %q, want cdfile (1).bin", snap.Filename)
 	}
-	if cd.hitCount() != hitsBefore+1 {
-		t.Fatalf("Retry re-download hits = %d, want %d", cd.hitCount(), hitsBefore+1)
+	if cd.downloadHitCount() != hitsBefore+1 {
+		t.Fatalf("Retry re-download hits = %d, want %d", cd.downloadHitCount(), hitsBefore+1)
 	}
 	// New file has downloaded content; original untouched.
 	got, _ := os.ReadFile(filepath.Join(dir, snap.Filename))
@@ -778,6 +793,16 @@ func TestRetryAndRemove(t *testing.T) {
 	// are exhausted; the manual Retry below then succeeds.
 	var attempts int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" {
+			// Probe request: answer like a server without Range
+			// support, without consuming the failure budget the
+			// test counts for the single-stream attempts below.
+			body := []byte("retry-ok")
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+			return
+		}
 		n := atomic.AddInt64(&attempts, 1)
 		if n <= int64(cfg.MaxRetries) {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1454,8 +1479,8 @@ func TestServiceEnforcesCanTransition(t *testing.T) {
 		if got := getJob(svc, id).ErrorCode; got != domain.ErrorCodeFileConflict {
 			t.Fatalf("ErrorCode = %q, want file_conflict", got)
 		}
-		if cd.hitCount() != 1 {
-			t.Fatalf("hits = %d, want 1 before ResolveConflict", cd.hitCount())
+		if cd.downloadHitCount() != 1 {
+			t.Fatalf("hits = %d, want 1 before ResolveConflict", cd.downloadHitCount())
 		}
 		if err := svc.ResolveConflict(id, domain.ResolutionAutoRename); err != nil {
 			t.Fatal(err)
@@ -1467,7 +1492,7 @@ func TestServiceEnforcesCanTransition(t *testing.T) {
 			t.Fatalf("status after ResolveConflict = %q, want failed (must not re-queue)", got)
 		}
 		time.Sleep(500 * time.Millisecond)
-		if got := cd.hitCount(); got != 1 {
+		if got := cd.downloadHitCount(); got != 1 {
 			t.Fatalf("server hits = %d, want 1 (ResolveConflict re-downloaded)", got)
 		}
 		if got := getJob(svc, id).Status; got != domain.StatusFailed {

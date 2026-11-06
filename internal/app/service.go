@@ -88,6 +88,10 @@ type Service struct {
 	mu         sync.RWMutex
 	cfg        config.Config
 	downloader domain.StreamDownloader
+	// prober verifies Range support and fetches validators before a
+	// download starts (Stage 3, Phase 2). A nil prober skips
+	// probing: the job runs single-stream with no validators.
+	prober engine.RangeProber
 	// repo persists every status change (Phase 5.1). A nil repo
 	// means the service runs RAM-only, exactly like Stage 1.
 	repo     domain.DownloadRepository
@@ -140,6 +144,7 @@ func NewServiceWithRepository(cfg config.Config, downloader domain.StreamDownloa
 		repo:       repo,
 		jobs:       make(map[string]*job),
 	}
+	svc.prober = engine.NewProber(cfg, nil)
 	// The scheduler owns the pending queue and the slot limits; the
 	// service feeds it jobs through startJob. A zero
 	// MaxConnectionsPerHost falls back to the scheduler default (4),
@@ -155,6 +160,15 @@ func NewServiceWithRepository(cfg config.Config, downloader domain.StreamDownloa
 func (s *Service) SetDownloadRepository(repo domain.DownloadRepository) {
 	s.mu.Lock()
 	s.repo = repo
+	s.mu.Unlock()
+}
+
+// SetProber attaches (or replaces) the range prober used before a
+// download starts. A nil prober skips probing: the job runs
+// single-stream with no validators, exactly like Stage 2.
+func (s *Service) SetProber(p engine.RangeProber) {
+	s.mu.Lock()
+	s.prober = p
 	s.mu.Unlock()
 }
 
@@ -1132,6 +1146,62 @@ func (s *Service) onProgress(id string, pu domain.ProgressUpdate) {
 	s.notify()
 }
 
+// parkIfStoppingLocked parks a job whose Pause or Cancel arrived
+// while it was waiting to start (before the transfer, or during the
+// probe). Caller must hold s.mu. When it returns true the lock has
+// been released and the caller must return from run() without
+// starting the downloader; when it returns false the job is still
+// probing and the caller keeps the lock.
+func (s *Service) parkIfStoppingLocked(j *job) bool {
+	if j.cancelling {
+		if err := s.setStatusLocked(j, domain.StatusCancelled); err != nil {
+			// Unreachable: probing -> cancelled is always allowed
+			// for a dispatched job.
+			s.mu.Unlock()
+			return true
+		}
+		j.pausing = false
+		j.download.SpeedBytesPerSec = 0
+		j.download.ETASeconds = -1
+		j.download.UpdatedAt = time.Now().UTC()
+		s.mu.Unlock()
+		return true
+	}
+	if j.pausing {
+		// Pause arrived before the worker started its transfer:
+		// park the job without ever calling the downloader.
+		// probing -> paused is always allowed for a dispatched job.
+		if err := s.setStatusLocked(j, domain.StatusPaused); err != nil {
+			s.mu.Unlock()
+			return true
+		}
+		j.pausing = false
+		j.download.SpeedBytesPerSec = 0
+		j.download.ETASeconds = -1
+		j.download.UpdatedAt = time.Now().UTC()
+		s.mu.Unlock()
+		return true
+	}
+	return false
+}
+
+// applyProbeResultLocked records a successful probe's validators on
+// the job and persists them through the repository (best effort: the
+// downloading transition that follows persists the whole entity
+// again, so a persist failure here is surfaced there instead of
+// failing the probe). A weak ETag is never stored: only a strong
+// ETag may serve as the If-Range validator. Caller must hold s.mu.
+func (s *Service) applyProbeResultLocked(j *job, pr engine.ProbeResult) {
+	j.download.ETag = engine.StrongETag(pr.ETag)
+	j.download.LastModified = pr.LastModified
+	j.download.SupportsRange = pr.SupportsRange
+	if pr.TotalBytes >= 0 {
+		j.download.TotalBytes = pr.TotalBytes
+	}
+	j.download.UpdatedAt = time.Now().UTC()
+	_ = s.persistLocked(j)
+}
+
 // run executes one job. done is closed (via defer) only after the
 // engine has returned and all file handles are closed.
 func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
@@ -1172,34 +1242,40 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 		s.mu.Unlock()
 		return
 	}
-	if j.cancelling {
-		if err := s.setStatusLocked(j, domain.StatusCancelled); err != nil {
-			// Unreachable: probing -> cancelled is always allowed
-			// for a dispatched job.
-			s.mu.Unlock()
-			return
-		}
-		j.pausing = false
-		j.download.SpeedBytesPerSec = 0
-		j.download.ETASeconds = -1
-		j.download.UpdatedAt = time.Now().UTC()
+	if s.parkIfStoppingLocked(j) {
+		return
+	}
+	prober := s.prober
+	url := j.download.URL
+	s.mu.Unlock()
+
+	// Probe for Range support and validators while the job is still
+	// probing. The lock is released here: Pause/Cancel must be able
+	// to park the job while the probe is in flight, and the probe
+	// runs on the job context, so it aborts as soon as they cancel
+	// it. A probe failure never fails the job: the download falls
+	// back to single-stream (plan §6), and the single-stream
+	// attempt reports the real error (404, auth, network) if there
+	// is one.
+	var pr engine.ProbeResult
+	probed := false
+	if prober != nil {
+		var perr error
+		pr, perr = prober.Probe(ctx, url)
+		probed = perr == nil
+	}
+
+	s.mu.Lock()
+	j, ok = s.jobs[id]
+	if !ok {
 		s.mu.Unlock()
 		return
 	}
-	if j.pausing {
-		// Pause arrived before the worker started its transfer:
-		// park the job without ever calling the downloader.
-		// probing -> paused is always allowed for a dispatched job.
-		if err := s.setStatusLocked(j, domain.StatusPaused); err != nil {
-			s.mu.Unlock()
-			return
-		}
-		j.pausing = false
-		j.download.SpeedBytesPerSec = 0
-		j.download.ETASeconds = -1
-		j.download.UpdatedAt = time.Now().UTC()
-		s.mu.Unlock()
+	if s.parkIfStoppingLocked(j) {
 		return
+	}
+	if probed {
+		s.applyProbeResultLocked(j, pr)
 	}
 	if err := s.setStatusLocked(j, domain.StatusDownloading); err != nil {
 		// Unreachable: probing -> downloading is always allowed for
@@ -1213,7 +1289,8 @@ func (s *Service) run(id string, ctx context.Context, done chan struct{}) {
 	j.download.UpdatedAt = time.Now().UTC()
 	j.lastBytes = 0
 	j.lastTime = time.Now()
-	url := j.download.URL
+	// url was captured before the probe above; the destination and
+	// mode are captured here.
 	destDir := j.download.DestinationDir
 	filename := j.download.Filename
 	mode := j.finalizeMode
