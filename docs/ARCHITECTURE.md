@@ -129,6 +129,7 @@ ponta-download-manager/
 - Domain model là dữ liệu; service trả **bản sao snapshot** cho UI thay vì chia sẻ map/struct đang bị ghi.
 - Worker dùng `context.Context` để hủy; đợi goroutine dừng trước khi cập nhật trạng thái cuối hoặc đóng file.
 - UI không chặn luồng render để chờ mạng/DB. Engine không import Fyne; service gom tiến độ và UI cập nhật bằng `fyne.Do`.
+- Trạng thái triển khai (Stage 2): scheduler đã tách khỏi service thành `internal/scheduler` — scheduler sở hữu hàng đợi và slot (tối đa 3 job chạy, tối đa 4 kết nối/host), serialize Pause/Resume/Cancel theo job ID; service chỉ gọi scheduler và giữ generation guard + `setStatusLocked`.
 
 ## 5. Mô hình dữ liệu
 
@@ -176,10 +177,10 @@ paused ──resume──► queued       failed ──retry──► queued
 - `failed ──► cancelled` chỉ dùng cho conflict resolution: người dùng chọn Cancel khi job `file_conflict` đang ở `failed`; `ResolveConflict(ResolutionCancel)` xóa file `.part` và chuyển job sang `cancelled`, vẫn có thể `Retry` lại (`cancelled ──► queued`).
 - `paused ──► cancelled`: Cancel vẫn dùng được trên job đang `paused` (không có worker đang chạy); nếu chọn xóa file tạm thì file `.part` được giữ lại từ lúc Pause sẽ bị xóa. Job `paused` không Remove trực tiếp được — Cancel trước (job sang `cancelled`), rồi Remove.
 
-- Các transition ghi DB nhất quán; service từ chối thao tác không hợp lệ. `completed` là terminal, trừ khi người dùng chủ động xóa bản ghi.
+- Các transition ghi DB nhất quán; service từ chối thao tác không hợp lệ. `completed` là terminal, trừ khi người dùng chủ động xóa bản ghi. Từ Stage 2, mọi chuyển trạng thái đều ghi xuống SQLite trong cùng thao tác; ghi DB lỗi thì giữ trạng thái cũ trong RAM và trả lỗi, không báo thành công giả.
 - `Pause` khi đang tải: phát cancel → chờ worker kết thúc → flush/checkpoint → ghi `paused`. UI có thể biểu diễn `pausing` tạm thời nhưng không được báo paused khi worker vẫn ghi.
 - `Cancel`: dừng worker; mặc định **hỏi người dùng** có xóa file tạm hay không. Xóa bản ghi và xóa file là hai lựa chọn riêng; không tự xóa file hoàn tất.
-- Khi startup: kiểm tra DB + file `.part`; `probing/downloading` từ phiên trước chuyển sang `paused` hoặc `queued` tùy cài đặt. Job `finalizing` cần reconciliation theo §8; không đánh dấu hoàn tất chỉ vì file có tồn tại.
+- Khi startup (Stage 2, quyết định đã chốt): kiểm tra DB + file `.part`; `probing`/`downloading` từ phiên trước chuyển sang `queued` để tự chạy tiếp (tải lại từ đầu, do Stage 1/2 chưa có resume từ điểm dừng); nếu metadata nói đã tải được byte mà file `.part` đã mất thì đánh `failed`. Job `finalizing` cần reconciliation theo §8: ở Stage 2 luôn đánh `failed` vì metadata bền vững không xác minh được file đích (kích thước/validator chỉ xuống DB ở lúc chuyển trạng thái); không đánh dấu hoàn tất chỉ vì file có tồn tại. Recovery không tự xóa hay ghi đè file nào; `Retry` tải lại từ đầu.
 
 ## 6. Quy trình tải
 
@@ -245,8 +246,8 @@ File thưa/preallocate có thể chứa byte chưa tải, vì vậy **kích thư
 
 ## 9. SQLite và migration
 
-- Stage 1 chưa có SQLite: settings (toàn bộ `config.Config`) được lưu dưới dạng JSON tại `<AppDataDir>/settings.json`, load lúc khởi động và save khi đổi trong dialog Settings. File thiếu, hỏng hoặc không hợp lệ thì dùng mặc định, không chặn khởi động; settings table SQLite ở Stage 2 sẽ thay thế file này.
-- Bắt đầu với `downloads`, `segments`, `schema_migrations`; chỉ thêm settings table khi thực sự cần. `segments.download_id` có foreign key, transaction xóa segment theo policy.
+- Settings (Stage 2): toàn bộ `config.Config` được lưu dưới dạng một JSON value dưới key `"config"` trong bảng `settings` của SQLite (`<AppDataDir>/pdm.db`). File JSON `<AppDataDir>/settings.json` của Stage 1 không còn là kho sống: lúc startup, nếu bảng `settings` trống và file JSON tồn tại và hợp lệ thì migrate một lần sang SQLite rồi xóa file JSON; JSON hỏng thì dùng mặc định, giữ nguyên file và chỉ log warning, không chặn khởi động. `internal/config/store.go` chỉ còn phục vụ migration và test, không còn đường production nào ghi JSON.
+- Các bảng: `downloads`, `segments`, `schema_migrations` và `settings` (thêm ở Stage 2, xem trên). `segments.download_id` có foreign key, transaction xóa segment theo policy.
 - Mở DB trong thư mục dữ liệu người dùng, bật `foreign_keys`; cân nhắc WAL và `busy_timeout` theo cách được driver hỗ trợ. Kiểm soát pool/ghi tuần tự để giảm `database is locked`. Các thiết lập theo connection phải được áp dụng nhất quán.
 - Thực hiện migration có version ngay lúc startup, trong transaction khi phù hợp; backup trước migration không tương thích. Không thay đổi schema kiểu ngầm định.
 - Không lưu cookie/password hay `Authorization` trong DB/log. URL có token hoặc query nhạy cảm cũng là secret; mặc định hạn chế lưu, che trong UI/log, cân nhắc keychain/credential store nếu muốn resume URL có xác thực. Không hứa xóa sạch token bằng cách chỉ xóa hàng SQLite vì WAL/backup có thể còn dữ liệu.
@@ -306,8 +307,8 @@ PDM desktop process → validate → hộp thoại xác nhận → hàng đợi
 - Chia segment: file 0 byte, file nhỏ hơn số worker, chia dư, không overlap/gap.
 - `httptest` server: 206 đúng/sai Content-Range; server trả 200 khi có Range; 416; HEAD 405; redirect; unknown length; slow/stall; drop kết nối; 429/503 Retry-After; nội dung/ETag thay đổi.
 - Pause/resume tại nhiều offset; retry sau ngắt; cancel không ghi thêm sau khi hoàn tất; worker errors và cleanup. Kiểm tra output byte-for-byte bằng SHA-256 đối chiếu file fixture.
-- Crash simulation: kill sau write trước sync, sau sync trước DB commit, sau commit, trước/sau rename và trước `completed`; dữ liệu không bị ghép sai và không overwrite file đích.
-- SQLite migration, khôi phục DB/file thiếu hoặc không nhất quán, hết dung lượng/quyền ghi, tên trùng, invalid path.
+- Crash simulation: kill sau write trước sync, sau sync trước DB commit, sau commit, trước/sau rename và trước `completed`; dữ liệu không bị ghép sai và không overwrite file đích. (Stage 2: chỉ test được phía DB commit + file `.part` qua recovery — xem `internal/app/crash_simulation_test.go`; checkpoint theo offset và resume thật là Stage 3.)
+- SQLite migration, khôi phục DB/file thiếu hoặc không nhất quán, hết dung lượng/quyền ghi, tên trùng, invalid path. (Stage 2: DB đóng/corrupt, orphan `.part`, tên trùng ở repo, invalid path ở service — xem `internal/storage/sqlite/crash_simulation_test.go` và `internal/app/crash_simulation_test.go`; hết dung lượng đĩa (ENOSPC) chưa mô phỏng được trong unit test.)
 - Dùng `go test ./...` và `go test -race ./...` trên môi trường có toolchain phù hợp; race detector không phát hiện mọi lỗi crash hay filesystem.
 - Test tay Fyne/tray, DPI, accessibility, mở/đóng, sleep/wake, proxy và đường truyền chập chờn trên từng OS.
 
@@ -325,7 +326,7 @@ PDM desktop process → validate → hộp thoại xác nhận → hàng đợi
 |---|---|
 | 0. Bootstrap | Go module, Fyne window chạy được, CI cơ bản. |
 | 1. Single stream | Thêm URL, tải một luồng vào `.part`, hiển thị và hủy an toàn. |
-| 2. Queue + persistence | SQLite migrations, scheduler, restart recovery, trạng thái rõ ràng. |
+| 2. Queue + persistence | SQLite migrations, scheduler, restart recovery, trạng thái rõ ràng. (Đã triển khai.) |
 | 3. Range + resume | Probe, segment, validator, checkpoint, pause/resume và test crash. |
 | 4. Desktop UX | Tray, settings, packaging, lỗi dễ hiểu, kiểm thử từng OS. |
 | 5. Browser | Extension, native host, IPC và phân tích bảo mật riêng. |

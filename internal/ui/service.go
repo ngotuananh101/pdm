@@ -90,11 +90,12 @@ type DownloadService interface {
 	// GetConfig returns the current settings.
 	GetConfig() Config
 	// SaveConfig validates the settings, stores them in memory, and
-	// persists them to the settings file in the app data directory
-	// (internal/config store, Phase 7 U1), so they survive a
-	// restart. It returns an error when validation or the disk
-	// write fails; in that case the in-memory settings may already
-	// be updated for this session, but they are not persisted.
+	// persists them to the settings table in the SQLite database in
+	// the app data directory (internal/storage/sqlite settings
+	// repository, Stage 2), so they survive a restart. It returns
+	// an error when validation or the database write fails; in that
+	// case the in-memory settings may already be updated for this
+	// session, but they are not persisted.
 	SaveConfig(ScratchConfig) error
 	// SetListener registers f, called after every state change. The
 	// service must not hold locks while calling f; UI handlers must
